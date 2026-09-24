@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -28,17 +29,20 @@ type actor struct {
 	ApprovalStatus string `json:"approval_status"`
 }
 type plan struct {
-	ID            int64  `json:"id"`
-	Name          string `json:"name"`
-	Kind          string `json:"kind"`
-	IsLimited     bool   `json:"is_limited"`
-	BasePrice     int64  `json:"base_price_toman"`
-	PriceGB       int64  `json:"price_per_gb_toman"`
-	MinGB         int    `json:"min_data_gb"`
-	BaseIP        int    `json:"base_ip_limit"`
-	MaxIP         int    `json:"max_ip_limit"`
-	MaxBytes      int64  `json:"max_data_bytes"`
-	ExpireSeconds int64  `json:"expire_seconds"`
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	Kind               string `json:"kind"`
+	IsLimited          bool   `json:"is_limited"`
+	BasePrice          int64  `json:"base_price_toman"`
+	PricePerExtraIP    int64  `json:"price_per_extra_ip_toman"`
+	PriceGB            int64  `json:"price_per_gb_toman"`
+	PricePerExtraMonth int64  `json:"price_per_extra_month_toman"`
+	MinGB              int    `json:"min_data_gb"`
+	BaseIP             int    `json:"base_ip_limit"`
+	MaxIP              int    `json:"max_ip_limit"`
+	MaxBytes           int64  `json:"max_data_bytes"`
+	ExpireSeconds      int64  `json:"expire_seconds"`
+	UsageDescription   string `json:"usage_description"`
 }
 type quote struct {
 	ID       int64  `json:"id"`
@@ -67,6 +71,8 @@ type subscriptionLinkPage struct {
 	Subscription subscriptionView
 	LinkIndex    int
 }
+
+const retailServicesPageSize = 6
 
 func subscriptionLinkPages(subscriptions []subscriptionView) []subscriptionLinkPage {
 	pages := make([]subscriptionLinkPage, 0, len(subscriptions))
@@ -280,11 +286,11 @@ func (a *botApp) resolve(c telebot.Context) (actor, error) {
 }
 func (a *botApp) start(c telebot.Context) error {
 	a.clearState(c.Sender().ID)
-	act, err := a.resolve(c)
+	_, err := a.resolve(c)
 	if err != nil {
 		return sendFailure(c, err)
 	}
-	return a.home(c, fmt.Sprintf("خوش آمدید. وضعیت حساب: %s", act.ApprovalStatus), false)
+	return a.home(c, "👋 به پنل کاربری خوش آمدید\nسرویس وی‌پی‌ان خود را مدیریت کنید یا سرویس جدید خریداری نمایید.", false)
 }
 func (a *botApp) adminCommand(c telebot.Context) error {
 	if !adminCommandSender(c.Sender(), c.Chat()) {
@@ -319,23 +325,26 @@ func (a *botApp) homeView(c telebot.Context, message string) (string, *telebot.R
 		return "", nil, err
 	}
 	m := &telebot.ReplyMarkup{}
-	rows := make([]telebot.Row, 0, 6)
+	rows := make([]telebot.Row, 0, 4)
 	if featureEnabled(features, "purchases_enabled") {
-		rows = append(rows, m.Row(m.Data(menuText(features, "menu_purchases", "🛍 طرح‌های خرید"), "nav", st.Nonce, "plans-paid")))
+		buy := m.Data(menuText(features, "menu_purchases", "💼 خرید سرویس"), "nav", st.Nonce, "plans-paid")
+		if featureEnabled(features, "trials_enabled") {
+			rows = append(rows, m.Row(m.Data(menuText(features, "menu_trials", "🧪 تست رایگان"), "nav", st.Nonce, "plans-test"), buy))
+		} else {
+			rows = append(rows, m.Row(buy))
+		}
+	} else if featureEnabled(features, "trials_enabled") {
+		rows = append(rows, m.Row(m.Data(menuText(features, "menu_trials", "🧪 تست رایگان"), "nav", st.Nonce, "plans-test")))
 	}
-	if featureEnabled(features, "trials_enabled") {
-		rows = append(rows, m.Row(m.Data(menuText(features, "menu_trials", "🧪 طرح‌های تست"), "nav", st.Nonce, "plans-test")))
-	}
-	if featureEnabled(features, "topups_enabled") {
-		rows = append(rows, m.Row(m.Data(menuText(features, "menu_topup", "💳 شارژ کیف پول"), "nav", st.Nonce, "topup")))
-	}
+	service := m.Data(menuText(features, "menu_services", "📋 سرویس‌های من"), "nav", st.Nonce, "services")
 	if featureEnabled(features, "wallet_enabled") {
-		rows = append(rows, m.Row(m.Data(menuText(features, "menu_wallet", "👛 موجودی"), "nav", st.Nonce, "wallet"), m.Data(menuText(features, "menu_ledger", "📜 تراکنش‌ها"), "nav", st.Nonce, "ledger")))
+		rows = append(rows, m.Row(service, m.Data(menuText(features, "menu_wallet", "👛 کیف پول"), "nav", st.Nonce, "wallet")))
+	} else {
+		rows = append(rows, m.Row(service))
 	}
-	rows = append(rows, m.Row(m.Data(menuText(features, "menu_services", "📡 اشتراک‌های من"), "nav", st.Nonce, "services")))
-	rows = append(rows, m.Row(m.Data("🔄 خانه", "nav", st.Nonce, "home")))
+	rows = append(rows, m.Row(m.Data(menuText(features, "menu_support", "🆘 پشتیبانی"), "nav", st.Nonce, "support")))
 	m.Inline(rows...)
-	if custom := strings.TrimSpace(features.Text["welcome"]); custom != "" && (message == "صفحه اصلی" || strings.HasPrefix(message, "خوش آمدید")) {
+	if custom := strings.TrimSpace(features.Text["welcome"]); custom != "" && (message == "صفحه اصلی" || strings.Contains(message, "به پنل کاربری خوش آمدید")) {
 		message = custom
 	}
 	return message, m, nil
@@ -450,12 +459,77 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 		}
 		st.PlanID = id
 		st.OperationKey = callbackOperationKey(c, "purchase", strconv.FormatInt(id, 10))
+		return a.showPurchaseDuration(c, st, true)
+	case "purchase-months":
+		if len(args) != 1 {
+			return a.home(c, "مدت اشتراک نامعتبر است.", true)
+		}
+		n, e := strconv.Atoi(args[0])
+		if e != nil || n < 1 || n > 36 {
+			return a.home(c, "مدت اشتراک نامعتبر است.", true)
+		}
+		st.Months = n
+		return a.afterPurchaseDuration(c, st, true)
+	case "purchase-data":
+		if len(args) != 1 {
+			return a.home(c, "حجم انتخاب شده نامعتبر است.", true)
+		}
+		n, e := strconv.Atoi(args[0])
+		if e != nil || n < 0 || n > 100000 {
+			return a.home(c, "حجم انتخاب شده نامعتبر است.", true)
+		}
+		st.DataGB = n
+		return a.showPurchaseIP(c, st, true)
+	case "purchase-ip":
+		if len(args) != 1 {
+			return a.home(c, "محدودیت IP نامعتبر است.", true)
+		}
+		n, e := strconv.Atoi(args[0])
+		if e != nil || n < 0 || n > 100 {
+			return a.home(c, "محدودیت IP نامعتبر است.", true)
+		}
+		st.IPLimit = n
+		st.Step = "purchase-name"
 		st = a.next(st)
 		a.setState(c.Sender().ID, st)
-		st = a.state(c.Sender().ID)
 		m := &telebot.ReplyMarkup{}
-		m.Inline(m.Row(m.Data("پرداخت با کیف پول", "nav", st.Nonce, "method-wallet")), m.Row(m.Data("پرداخت مستقیم", "nav", st.Nonce, "method-direct")), m.Row(m.Data("↩️ طرح‌ها", "nav", st.Nonce, "plans-paid")))
-		return c.Edit("روش پرداخت را انتخاب کنید.", m)
+		m.Inline(m.Row(m.Data("🎲 نام پیش‌فرض", "nav", st.Nonce, "purchase-default-name")), m.Row(m.Data("« بازگشت", "nav", st.Nonce, "purchase-ip-back")))
+		return present(c, "نام دلخواه سرویس را بفرستید یا نام پیش‌فرض را انتخاب کنید.", m, true)
+	case "purchase-default-name":
+		st.Name = ""
+		return a.showPaymentMethods(c, st, true)
+	case "purchase-ip-back":
+		return a.showPurchaseIP(c, st, true)
+	case "purchase-plan-back":
+		return a.showPlans(c, "paid", true)
+	case "purchase-duration-custom":
+		st.Step = "purchase-months"
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.prompt(c, "لطفاً تعداد ماه را بفرستید (۱ تا ۳۶).", true)
+	case "purchase-data-custom":
+		st.Step = "purchase-gb"
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.prompt(c, "لطفاً حجم مورد نظر را به GB بفرستید.", true)
+	case "purchase-ip-custom":
+		st.Step = "purchase-ip"
+		st = a.next(st)
+		a.setState(c.Sender().ID, st)
+		return a.prompt(c, "تعداد IP هم‌زمان را وارد کنید.", true)
+	case "support":
+		features, e := a.getFeatures(c)
+		if e != nil {
+			return sendFailure(c, e)
+		}
+		text := strings.TrimSpace(features.Text["support"])
+		if text == "" {
+			text = "برای پشتیبانی لطفاً با مدیر ربات در ارتباط باشید."
+		}
+		m := &telebot.ReplyMarkup{}
+		next := a.state(c.Sender().ID)
+		m.Inline(m.Row(m.Data("« بازگشت", "nav", next.Nonce, "home")))
+		return present(c, text, m, true)
 	case "method-wallet", "method-direct":
 		features, e := a.getFeatures(c)
 		if e != nil {
@@ -474,10 +548,7 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 		if action == "method-direct" {
 			st.Method = "direct"
 		}
-		st.Step = "purchase-months"
-		st = a.next(st)
-		a.setState(c.Sender().ID, st)
-		return a.prompt(c, "مدت اشتراک را به ماه وارد کنید.", true)
+		return a.completePurchase(c, st)
 	case "topup":
 		features, e := a.getFeatures(c)
 		if e != nil {
@@ -520,6 +591,15 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 			return a.services(c, true)
 		}
 		return a.servicesPage(c, true, offset)
+	case "services-view":
+		if len(args) != 1 {
+			return a.services(c, true)
+		}
+		id, e := strconv.ParseInt(args[0], 10, 64)
+		if e != nil || id <= 0 {
+			return a.services(c, true)
+		}
+		return a.serviceDetail(c, id, true)
 	case "cancel":
 		if len(args) != 1 {
 			return a.home(c, "درخواست نامعتبر است.", true)
@@ -673,6 +753,122 @@ func (a *botApp) prompt(c telebot.Context, text string, edit bool) error {
 	m.Inline(m.Row(m.Data("↩️ خانه", "nav", st.Nonce, "home")))
 	return present(c, text, m, edit)
 }
+
+func (a *botApp) planByID(c telebot.Context, id int64) (plan, error) {
+	act, err := a.resolve(c)
+	if err != nil {
+		return plan{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var items []plan
+	if err = a.api.Call(ctx, "GET", "/v1/plans?kind=paid", act.TelegramID, nil, &items); err != nil {
+		return plan{}, err
+	}
+	for _, p := range items {
+		if p.ID == id {
+			return p, nil
+		}
+	}
+	return plan{}, fmt.Errorf("selected plan is unavailable")
+}
+
+func (a *botApp) showPurchaseDuration(c telebot.Context, st conversation, edit bool) error {
+	p, err := a.planByID(c, st.PlanID)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	st.Step = ""
+	st = a.next(st)
+	a.setState(c.Sender().ID, st)
+	st = a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	m.Inline(
+		m.Row(m.Data("۱ ماهه", "nav", st.Nonce, "purchase-months", "1"), m.Data("۳ ماهه", "nav", st.Nonce, "purchase-months", "3")),
+		m.Row(m.Data("۶ ماهه", "nav", st.Nonce, "purchase-months", "6"), m.Data("✏️ مدت دلخواه", "nav", st.Nonce, "purchase-duration-custom")),
+		m.Row(m.Data("« بازگشت", "nav", st.Nonce, "purchase-plan-back")),
+	)
+	text := fmt.Sprintf("💼 طرح خرید سرویس\n\n📦 %s\nقیمت پایه: %s تومان در ماه\nتعداد IP هم‌زمان: %d تا %d\n\nمدت زمان سرویس را انتخاب کنید:", p.Name, numberLabel(p.BasePrice), p.BaseIP, p.MaxIP)
+	if p.IsLimited {
+		text = fmt.Sprintf("💼 طرح خرید سرویس\n\n📦 %s\nقیمت هر گیگابایت: %s تومان\nحداقل ترافیک: %d گیگابایت\nتعداد IP هم‌زمان: %d تا %d\n\nمدت زمان سرویس را انتخاب کنید:", p.Name, numberLabel(p.PriceGB), p.MinGB, p.BaseIP, p.MaxIP)
+	}
+	return present(c, text, m, edit)
+}
+
+func (a *botApp) afterPurchaseDuration(c telebot.Context, st conversation, edit bool) error {
+	p, err := a.planByID(c, st.PlanID)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	if p.IsLimited {
+		return a.showPurchaseData(c, st, p, edit)
+	}
+	return a.showPurchaseIP(c, st, edit)
+}
+
+func (a *botApp) showPurchaseData(c telebot.Context, st conversation, p plan, edit bool) error {
+	st = a.next(st)
+	a.setState(c.Sender().ID, st)
+	st = a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	min := p.MinGB
+	if min < 1 {
+		min = 1
+	}
+	m.Inline(
+		m.Row(m.Data(fmt.Sprintf("%d گیگابایت", min), "nav", st.Nonce, "purchase-data", strconv.Itoa(min)), m.Data(fmt.Sprintf("%d گیگابایت", min+10), "nav", st.Nonce, "purchase-data", strconv.Itoa(min+10))),
+		m.Row(m.Data(fmt.Sprintf("%d گیگابایت", min+30), "nav", st.Nonce, "purchase-data", strconv.Itoa(min+30)), m.Data(fmt.Sprintf("%d گیگابایت", min+50), "nav", st.Nonce, "purchase-data", strconv.Itoa(min+50))),
+		m.Row(m.Data("✏️ حجم دلخواه", "nav", st.Nonce, "purchase-data-custom")),
+		m.Row(m.Data("« بازگشت", "nav", st.Nonce, "plans-paid")),
+	)
+	return present(c, fmt.Sprintf("📦 %s — %d ماهه\nلطفاً ترافیک مورد نظر را انتخاب کنید (حداقل %d گیگابایت):", p.Name, st.Months, min), m, edit)
+}
+
+func (a *botApp) showPurchaseIP(c telebot.Context, st conversation, edit bool) error {
+	p, err := a.planByID(c, st.PlanID)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	st = a.next(st)
+	a.setState(c.Sender().ID, st)
+	st = a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	rows := make([]telebot.Row, 0, 10)
+	for ip := p.BaseIP; ip <= p.MaxIP && len(rows) < 8; ip++ {
+		label := fmt.Sprintf("%d IP هم‌زمان", ip)
+		if ip == 0 {
+			label = "IP هم‌زمان نامحدود"
+		}
+		rows = append(rows, m.Row(m.Data(label, "nav", st.Nonce, "purchase-ip", strconv.Itoa(ip))))
+	}
+	rows = append(rows, m.Row(m.Data("✏️ تعداد دلخواه", "nav", st.Nonce, "purchase-ip-custom")))
+	rows = append(rows, m.Row(m.Data("« بازگشت", "nav", st.Nonce, "purchase-plan-back")))
+	m.Inline(rows...)
+	return present(c, fmt.Sprintf("📦 %s — %d ماهه\nتعداد IP هم‌زمان را انتخاب کنید:", p.Name, st.Months), m, edit)
+}
+
+func (a *botApp) showPaymentMethods(c telebot.Context, st conversation, edit bool) error {
+	features, err := a.getFeatures(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	st.Step = ""
+	st = a.next(st)
+	a.setState(c.Sender().ID, st)
+	st = a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	rows := make([]telebot.Row, 0, 3)
+	if featureEnabled(features, "wallet_enabled") {
+		rows = append(rows, m.Row(m.Data("👛 پرداخت از کیف پول", "nav", st.Nonce, "method-wallet")))
+	}
+	if featureEnabled(features, "direct_payments_enabled") {
+		rows = append(rows, m.Row(m.Data("💳 پرداخت مستقیم (کارت به کارت)", "nav", st.Nonce, "method-direct")))
+	}
+	rows = append(rows, m.Row(m.Data("« بازگشت", "nav", st.Nonce, "plans-paid")))
+	m.Inline(rows...)
+	return present(c, "سرویس شما آماده ثبت است. روش پرداخت را انتخاب کنید:", m, edit)
+}
+
 func (a *botApp) showPlans(c telebot.Context, kind string, edit bool) error {
 	act, err := a.resolve(c)
 	if err != nil {
@@ -692,16 +888,31 @@ func (a *botApp) showPlans(c telebot.Context, kind string, edit bool) error {
 	}
 	st := a.state(c.Sender().ID)
 	m := &telebot.ReplyMarkup{}
-	rows := make([]telebot.Row, 0, len(items)+2)
+	rows := make([]telebot.Row, 0, len(items)+1)
 	var summary strings.Builder
 	for _, p := range items {
 		if kind == "test" {
-			fmt.Fprintf(&summary, "🧪 %s | %d ثانیه پس از اولین اتصال | %d بایت\n", p.Name, p.ExpireSeconds, p.MaxBytes)
+			data := "نامحدود"
+			if p.MaxBytes > 0 {
+				data = fmt.Sprintf("%.2f گیگابایت", float64(p.MaxBytes)/1073741824)
+			}
+			fmt.Fprintf(&summary, "📦 %s\n⏱️ مدت اعتبار: %s (پس از اولین اتصال)\n📊 حجم مجاز: %s\n🔄 سهمیه هنگام ثبت درخواست بررسی می‌شود.\n", p.Name, humanDuration(p.ExpireSeconds), data)
+			if p.UsageDescription != "" {
+				fmt.Fprintf(&summary, "%s\n", p.UsageDescription)
+			}
+			summary.WriteString("\n")
 		} else if p.IsLimited {
-			fmt.Fprintf(&summary, "📦 %s | هر گیگابایت %d تومان | حداقل %dGB | IP %d تا %d\n", p.Name, p.PriceGB, p.MinGB, p.BaseIP, p.MaxIP)
+			fmt.Fprintf(&summary, "📦 %s (محدود)\nقیمت هر گیگابایت: %s تومان\nحداقل ترافیک: %d گیگابایت\nماهانه اضافه: +%s تومان\nIP هم‌زمان: %d تا %d\n", p.Name, numberLabel(p.PriceGB), p.MinGB, numberLabel(p.PricePerExtraMonth), p.BaseIP, p.MaxIP)
 		} else {
-			fmt.Fprintf(&summary, "📦 %s | پایه %d تومان/ماه | IP %d تا %d\n", p.Name, p.BasePrice, p.BaseIP, p.MaxIP)
+			fmt.Fprintf(&summary, "📦 %s (نامحدود)\nقیمت پایه: %s تومان در ماه\nIP هم‌زمان: %d تا %d\n", p.Name, numberLabel(p.BasePrice), p.BaseIP, p.MaxIP)
 		}
+		if kind == "paid" {
+			fmt.Fprintf(&summary, "هزینه هر IP اضافه: +%s تومان در ماه\n", numberLabel(p.PricePerExtraIP))
+		}
+		if p.UsageDescription != "" && kind == "paid" {
+			fmt.Fprintf(&summary, "%s\n", p.UsageDescription)
+		}
+		summary.WriteString("\n")
 		label := p.Name
 		if len([]rune(label)) > 28 {
 			label = string([]rune(label)[:28])
@@ -710,12 +921,31 @@ func (a *botApp) showPlans(c telebot.Context, kind string, edit bool) error {
 		if kind == "test" {
 			actName = "select-test"
 		}
-		rows = append(rows, m.Row(m.Data(label, "nav", st.Nonce, actName, strconv.FormatInt(p.ID, 10))))
+		rows = append(rows, m.Row(m.Data("📦 "+label, "nav", st.Nonce, actName, strconv.FormatInt(p.ID, 10))))
 	}
-	rows = append(rows, m.Row(m.Data("↩️ خانه", "nav", st.Nonce, "home")))
+	rows = append(rows, m.Row(m.Data("« بازگشت", "nav", st.Nonce, "home")))
 	m.Inline(rows...)
 	return present(c, strings.TrimSpace(summary.String()), m, edit)
 }
+
+func humanDuration(seconds int64) string {
+	if seconds <= 0 {
+		return "نامشخص"
+	}
+	days := seconds / 86400
+	if days >= 30 && days%30 == 0 {
+		return fmt.Sprintf("%d ماه (%d روز)", days/30, days)
+	}
+	if days > 0 {
+		return fmt.Sprintf("%d روز", days)
+	}
+	hours := seconds / 3600
+	if hours > 0 {
+		return fmt.Sprintf("%d ساعت", hours)
+	}
+	return fmt.Sprintf("%d دقیقه", seconds/60)
+}
+
 func (a *botApp) createTrial(c telebot.Context, planID int64) error {
 	act, err := a.resolve(c)
 	if err != nil {
@@ -749,32 +979,29 @@ func (a *botApp) text(c telebot.Context) error {
 			return c.Send("مدت را به‌صورت عددی بین ۱ تا ۳۶ ماه بفرستید.")
 		}
 		st.Months = n
-		st.Step = "purchase-ip"
-		a.setState(c.Sender().ID, st)
-		return c.Send("تعداد IP هم‌زمان را وارد کنید.")
+		return a.afterPurchaseDuration(c, st, false)
 	case "purchase-ip":
 		n, e := strconv.Atoi(value)
-		if e != nil || n < 1 || n > 100 {
-			return c.Send("تعداد IP معتبر نیست. عددی بین ۱ تا ۱۰۰ بفرستید.")
+		if e != nil || n < 0 || n > 100 {
+			return c.Send("تعداد IP معتبر نیست. عددی بین ۰ تا ۱۰۰ بفرستید.")
 		}
 		st.IPLimit = n
-		st.Step = "purchase-gb"
+		st.Step = "purchase-name"
+		st = a.next(st)
 		a.setState(c.Sender().ID, st)
-		return c.Send("حجم را به GB وارد کنید؛ برای نامحدود ۰ بفرستید.")
+		return c.Send("نام دلخواه سرویس را بفرستید یا «-» را برای نام پیش‌فرض ارسال کنید.")
 	case "purchase-gb":
 		n, e := strconv.Atoi(value)
 		if e != nil || n < 0 || n > 100000 {
 			return c.Send("حجم نامعتبر است.")
 		}
 		st.DataGB = n
-		st.Step = "purchase-name"
-		a.setState(c.Sender().ID, st)
-		return c.Send("نام دلخواه اشتراک را بفرستید (یا «-» برای نام پیش‌فرض).")
+		return a.showPurchaseIP(c, st, false)
 	case "purchase-name":
 		if value != "-" {
 			st.Name = value
 		}
-		return a.completePurchase(c, st)
+		return a.showPaymentMethods(c, st, false)
 	case "topup-amount":
 		amount, e := strconv.ParseInt(value, 10, 64)
 		if e != nil || amount <= 0 {
@@ -837,8 +1064,36 @@ func (a *botApp) wallet(c telebot.Context, edit bool) error {
 	}
 	st := a.state(c.Sender().ID)
 	m := &telebot.ReplyMarkup{}
-	m.Inline(m.Row(m.Data("➕ شارژ کیف پول", "nav", st.Nonce, "topup")), m.Row(m.Data("📜 تراکنش‌ها", "nav", st.Nonce, "ledger"), m.Data("🏠 خانه", "nav", st.Nonce, "home")))
-	return present(c, fmt.Sprintf("موجودی کیف پول: %v تومان", out["balance_toman"]), m, edit)
+	rows := []telebot.Row{m.Row(m.Data("📥 شارژ کیف پول", "nav", st.Nonce, "topup"))}
+	if c.Sender().ID == adminTelegramID && act.Role == "admin" {
+		rows = append(rows, m.Row(m.Data("⏳ تراکنش‌های در انتظار شارژ", "nav", st.Nonce, "pending-topups")))
+	}
+	rows = append(rows, m.Row(m.Data("« بازگشت", "nav", st.Nonce, "home")))
+	m.Inline(rows...)
+	return present(c, fmt.Sprintf("👛 موجودی کیف پول شما: %s تومان", formatToman(out["balance_toman"])), m, edit)
+}
+
+func formatToman(value any) string {
+	var n int64
+	switch v := value.(type) {
+	case float64:
+		n = int64(v)
+	case int64:
+		n = v
+	case int:
+		n = int64(v)
+	case json.Number:
+		n, _ = v.Int64()
+	case string:
+		n, _ = strconv.ParseInt(v, 10, 64)
+	default:
+		return fmt.Sprint(value)
+	}
+	s := strconv.FormatInt(n, 10)
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
 }
 func (a *botApp) ledger(c telebot.Context, edit bool) error {
 	act, err := a.resolve(c)
@@ -930,48 +1185,121 @@ func (a *botApp) servicesPage(c telebot.Context, edit bool, offset int) error {
 		return sendFailure(c, err)
 	}
 	if len(out) == 0 {
-		return a.home(c, "اشتراکی ثبت نشده است.", edit)
+		st := a.state(c.Sender().ID)
+		m := &telebot.ReplyMarkup{}
+		m.Inline(m.Row(m.Data("« بازگشت", "nav", st.Nonce, "home")))
+		return present(c, "📋 شما در حال حاضر هیچ اشتراکی ندارید.\nبرای شروع از گزینه‌های تست رایگان یا خرید سرویس استفاده کنید.", m, edit)
 	}
-	pages := subscriptionLinkPages(out)
+	totalPages := (len(out) + retailServicesPageSize - 1) / retailServicesPageSize
 	if offset < 0 {
 		offset = 0
 	}
-	if offset >= len(pages) {
-		offset = len(pages) - 1
+	if offset >= totalPages {
+		offset = totalPages - 1
 	}
-	page := pages[offset]
-	sub := page.Subscription
-	text := fmt.Sprintf("اتصال %d از %d\nاشتراک: %s (#%d)\nوضعیت: %s | نوع: %s\nایمیل: %s\nمحدودیت IP: %d | حجم: %d بایت", offset+1, len(pages), sub.DisplayName, sub.ID, sub.Status, sub.Kind, sub.Email, sub.IPLimit, sub.TrafficLimitBytes)
-	if sub.ExpiryTimeMS > 0 {
-		text += fmt.Sprintf("\nپایان اعتبار: %s", time.UnixMilli(sub.ExpiryTimeMS).UTC().Format("2006-01-02 15:04 UTC"))
+	start := offset * retailServicesPageSize
+	end := start + retailServicesPageSize
+	if end > len(out) {
+		end = len(out)
 	}
 	m := &telebot.ReplyMarkup{}
 	st := a.state(c.Sender().ID)
-	rows := make([]telebot.Row, 0, 5)
-	if page.LinkIndex >= 0 {
-		link := sub.Links[page.LinkIndex]
-		if strings.HasPrefix(link, "https://") || strings.HasPrefix(link, "http://") {
-			rows = append(rows, m.Row(m.URL("🔗 باز کردن اتصال", link)))
-		} else {
-			text += fmt.Sprintf("\nلینک %d از %d:\n%s", page.LinkIndex+1, len(sub.Links), link)
+	rows := make([]telebot.Row, 0, retailServicesPageSize+3)
+	var text strings.Builder
+	fmt.Fprintf(&text, "📋 سرویس‌های من (صفحه %d از %d)\n\n", offset+1, totalPages)
+	for _, sub := range out[start:end] {
+		icon := "🔴"
+		if sub.Status == "active" {
+			icon = "🟢"
 		}
-	} else {
-		text += "\nهنوز لینک اتصالی در دسترس نیست."
+		expires := "بدون تاریخ انقضا"
+		if sub.ExpiryTimeMS < 0 {
+			expires = "شروع پس از اولین اتصال"
+		} else if sub.ExpiryTimeMS > 0 {
+			expires = "انقضا: " + time.UnixMilli(sub.ExpiryTimeMS).UTC().Format("2006-01-02")
+		}
+		name := sub.DisplayName
+		if name == "" {
+			name = sub.Email
+		}
+		fmt.Fprintf(&text, "%s %s — %s\n", icon, name, expires)
+		rows = append(rows, m.Row(m.Data(icon+" "+truncateButton(name), "nav", st.Nonce, "services-view", strconv.FormatInt(sub.ID, 10))))
 	}
-	rows = append(rows, m.Row(m.Data("درخواست لغو اشتراک", "nav", st.Nonce, "cancel", strconv.FormatInt(sub.ID, 10))))
 	navigation := make([]telebot.Btn, 0, 2)
 	if offset > 0 {
-		navigation = append(navigation, m.Data("◀ قبلی", "nav", st.Nonce, "services-page", strconv.Itoa(offset-1)))
+		navigation = append(navigation, m.Data("◀️ قبلی", "nav", st.Nonce, "services-page", strconv.Itoa(offset-1)))
 	}
-	if offset+1 < len(pages) {
-		navigation = append(navigation, m.Data("بعدی ▶", "nav", st.Nonce, "services-page", strconv.Itoa(offset+1)))
+	if offset+1 < totalPages {
+		navigation = append(navigation, m.Data("بعدی ▶️", "nav", st.Nonce, "services-page", strconv.Itoa(offset+1)))
 	}
 	if len(navigation) > 0 {
 		rows = append(rows, m.Row(navigation...))
 	}
 	rows = append(rows, m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
 	m.Inline(rows...)
+	return present(c, strings.TrimSpace(text.String()), m, edit)
+}
+
+func (a *botApp) serviceDetail(c telebot.Context, id int64, edit bool) error {
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var items []subscriptionView
+	if err = a.api.Call(ctx, "GET", "/v1/subscriptions", act.TelegramID, nil, &items); err != nil {
+		return sendFailure(c, err)
+	}
+	var sub *subscriptionView
+	for i := range items {
+		if items[i].ID == id {
+			sub = &items[i]
+			break
+		}
+	}
+	if sub == nil {
+		return a.services(c, edit)
+	}
+	status := "🔴 غیرفعال"
+	if sub.Status == "active" {
+		status = "🟢 فعال"
+	}
+	name := sub.DisplayName
+	if name == "" {
+		name = sub.Email
+	}
+	text := fmt.Sprintf("📋 %s\n%s\nنوع: %s\nایمیل: %s\nمحدودیت IP: %d\nحجم: %.2f گیگابایت", name, status, sub.Kind, sub.Email, sub.IPLimit, float64(sub.TrafficLimitBytes)/1073741824)
+	if sub.TrafficLimitBytes <= 0 {
+		text = strings.Replace(text, "حجم: 0.00 گیگابایت", "حجم: نامحدود", 1)
+	}
+	if sub.ExpiryTimeMS < 0 {
+		text += "\nمدت اعتبار: پس از اولین اتصال"
+	} else if sub.ExpiryTimeMS > 0 {
+		text += "\nانقضا: " + time.UnixMilli(sub.ExpiryTimeMS).UTC().Format("2006-01-02 15:04 UTC")
+	}
+	m := &telebot.ReplyMarkup{}
+	st := a.state(c.Sender().ID)
+	rows := make([]telebot.Row, 0, len(sub.Links)+2)
+	for i, link := range sub.Links {
+		if strings.HasPrefix(link, "https://") || strings.HasPrefix(link, "http://") {
+			rows = append(rows, m.Row(m.URL(fmt.Sprintf("🔗 دریافت لینک اتصال %d", i+1), link)))
+		} else {
+			text += fmt.Sprintf("\n\n🔗 لینک اتصال %d:\n%s", i+1, link)
+		}
+	}
+	rows = append(rows, m.Row(m.Data("🗑 درخواست لغو سرویس", "nav", st.Nonce, "cancel", strconv.FormatInt(sub.ID, 10))))
+	rows = append(rows, m.Row(m.Data("« بازگشت", "nav", st.Nonce, "services")))
+	m.Inline(rows...)
 	return present(c, text, m, edit)
+}
+
+func truncateButton(value string) string {
+	runes := []rune(value)
+	if len(runes) > 32 {
+		return string(runes[:32])
+	}
+	return value
 }
 func (a *botApp) cancelSubscription(c telebot.Context, id int64) error {
 	act, err := a.resolve(c)
