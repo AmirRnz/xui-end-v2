@@ -13,11 +13,11 @@ $env:BACKEND_TOKEN = '...'
 go run ./cmd/bot
 ```
 
-Available commands are `/plans`, `/plans test`, `/trial <plan_id>`, `/buy <plan_id> <months> <ip_limit> <data_gb> [name]`, `/pay ...`, `/wallet`, `/ledger`, `/topup <amount_toman>`, `/receipt <intent_id>`, `/topupreceipt <topup_id>`, `/services`, and `/cancel <subscription_id>`. `data_gb` is `0` for an unlimited plan. A receipt photo is sent after its corresponding receipt command. The retail trial reset is enforced in the backend per account and plan; nonpositive reset days mean one claim ever. Duplicate Telegram updates use stable message-scoped idempotency keys.
+The bot opens on an inline-button home screen. Customers can browse paid and test plans, choose wallet or direct payment, create top-ups, submit receipt photos, review wallet history and services, and request subscription cancellation. Purchase prompts collect months, IP limit, data in GB (`0` means unlimited), and an optional display name. The retail trial reset is enforced in the backend per account and plan; nonpositive reset days mean one claim ever. Duplicate Telegram actions use stable message-scoped idempotency keys. Old command menus are cleared at process startup; `/start` remains as the Telegram entry point.
 
-Run a separate process and use a separate backend token for each retail deployment: Finland (`retail-finland`) and Germany (`retail-germany`).
+This v2 adapter is scoped to `retail-finland`. Germany remains a separate deployment and is outside this bot's admin scope.
 
-Admin commands `/pending`, `/approve <intent_id>`, `/pendingtopups`, and `/approvetopup <topup_id>` are also backend-authorized. The bot does not decide admin roles.
+Telegram user `96937669` sees the administrator menu only when the backend resolves that actor as `admin`. It reviews pending payments and top-ups, and configures plans and prices, payment instructions, retail trial reset, feature switches, user-facing text, and panel URL/credential. Plan settings use field-by-field menus. Backend authorization remains authoritative. Panel credentials are submitted in a private chat, the incoming token message is deleted when Telegram permits it, and the backend never returns the credential. Admin actions in this adapter are restricted to the `retail-finland` deployment.
 
 ```powershell
 go vet ./...
