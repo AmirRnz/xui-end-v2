@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"example.com/xui-end-bot-v2/internal/backend"
 )
 
 func TestStableKeyTracksTelegramMessageAndOperation(t *testing.T) {
@@ -77,5 +79,16 @@ func TestSubscriptionPagesExposeEveryLinkAndEmptyLinkSubscription(t *testing.T) 
 	}
 	if pages[0].Subscription.ID != 10 || pages[0].LinkIndex != 0 || pages[1].Subscription.ID != 10 || pages[1].LinkIndex != 1 || pages[2].Subscription.ID != 11 || pages[2].LinkIndex != -1 {
 		t.Fatalf("subscription links were dropped or misordered: %#v", pages)
+	}
+}
+
+func TestFailureDiagnosticUsesOnlySanitizedBackendCategory(t *testing.T) {
+	status, category := failureDiagnostic(&backend.APIError{Status: 503, Code: "service_unavailable", Message: "sensitive backend detail"})
+	if status != 503 || category != "service_unavailable" {
+		t.Fatalf("expected safe status/category, got %d/%q", status, category)
+	}
+	status, category = failureDiagnostic(&backend.APIError{Status: 500, Code: "bad\nsecret", Message: "sensitive backend detail"})
+	if status != 500 || category != "backend_error" {
+		t.Fatalf("unsafe backend error code must be reduced to generic category, got %d/%q", status, category)
 	}
 }

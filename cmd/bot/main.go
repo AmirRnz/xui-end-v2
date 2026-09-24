@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -264,12 +265,23 @@ func (a *botApp) start(c telebot.Context) error {
 func (a *botApp) home(c telebot.Context, message string, edit bool) error {
 	st := a.next(conversation{})
 	a.setState(c.Sender().ID, st)
-	st = a.state(c.Sender().ID)
-	m := &telebot.ReplyMarkup{}
-	features, ferr := a.getFeatures(c)
-	if ferr != nil {
-		return sendFailure(c, ferr)
+	text, m, err := a.homeView(c, message)
+	if err != nil {
+		return sendFailure(c, err)
 	}
+	return present(c, text, m, edit)
+}
+func (a *botApp) homeView(c telebot.Context, message string) (string, *telebot.ReplyMarkup, error) {
+	st := a.state(c.Sender().ID)
+	act, err := a.resolve(c)
+	if err != nil {
+		return "", nil, err
+	}
+	features, err := a.getFeaturesForActor(act)
+	if err != nil {
+		return "", nil, err
+	}
+	m := &telebot.ReplyMarkup{}
 	rows := make([]telebot.Row, 0, 6)
 	if featureEnabled(features, "purchases_enabled") {
 		rows = append(rows, m.Row(m.Data(menuText(features, "menu_purchases", "🛍 طرح‌های خرید"), "nav", st.Nonce, "plans-paid")))
@@ -284,8 +296,7 @@ func (a *botApp) home(c telebot.Context, message string, edit bool) error {
 		rows = append(rows, m.Row(m.Data(menuText(features, "menu_wallet", "👛 موجودی"), "nav", st.Nonce, "wallet"), m.Data(menuText(features, "menu_ledger", "📜 تراکنش‌ها"), "nav", st.Nonce, "ledger")))
 	}
 	rows = append(rows, m.Row(m.Data(menuText(features, "menu_services", "📡 اشتراک‌های من"), "nav", st.Nonce, "services")))
-	act, err := a.resolve(c)
-	if err == nil && c.Sender().ID == adminTelegramID && act.Role == "admin" {
+	if c.Sender().ID == adminTelegramID && act.Role == "admin" {
 		rows = append(rows, m.Row(m.Data("⚙️ مدیریت", "nav", st.Nonce, "admin")))
 	}
 	rows = append(rows, m.Row(m.Data("🔄 خانه", "nav", st.Nonce, "home")))
@@ -293,32 +304,34 @@ func (a *botApp) home(c telebot.Context, message string, edit bool) error {
 	if custom := strings.TrimSpace(features.Text["welcome"]); custom != "" && (message == "صفحه اصلی" || strings.HasPrefix(message, "خوش آمدید")) {
 		message = custom
 	}
-	return present(c, message, m, edit)
+	return message, m, nil
 }
 func (a *botApp) freshHome(c telebot.Context, message string) error {
 	a.setState(c.Sender().ID, conversation{})
-	st := a.state(c.Sender().ID)
-	m := &telebot.ReplyMarkup{}
-	rows := []telebot.Row{m.Row(m.Data("🛍 طرح‌های خرید", "nav", st.Nonce, "plans-paid"), m.Data("🧪 طرح‌های تست", "nav", st.Nonce, "plans-test")), m.Row(m.Data("💳 شارژ کیف پول", "nav", st.Nonce, "topup"), m.Data("👛 موجودی", "nav", st.Nonce, "wallet")), m.Row(m.Data("📜 تراکنش‌ها", "nav", st.Nonce, "ledger"), m.Data("📡 اشتراک‌های من", "nav", st.Nonce, "services"))}
-	if c.Sender().ID == adminTelegramID {
-		rows = append(rows, m.Row(m.Data("⚙️ مدیریت", "nav", st.Nonce, "admin")))
+	text, m, err := a.homeView(c, message)
+	if err != nil {
+		st := a.state(c.Sender().ID)
+		m = &telebot.ReplyMarkup{}
+		m.Inline(m.Row(m.Data("🔄 تلاش دوباره", "nav", st.Nonce, "home")))
+		text = "منو در دسترس نیست. برای بارگذاری دوباره دکمه زیر را بزنید."
 	}
-	rows = append(rows, m.Row(m.Data("🔄 خانه", "nav", st.Nonce, "home")))
-	m.Inline(rows...)
-	if err := c.Edit(message, m); err == nil {
+	if err := c.Edit(text, m); err == nil {
 		return nil
 	}
-	return c.Send(message, m)
+	return c.Send(text, m)
 }
 func (a *botApp) getFeatures(c telebot.Context) (publicFeatures, error) {
 	act, err := a.resolve(c)
 	if err != nil {
 		return publicFeatures{}, err
 	}
+	return a.getFeaturesForActor(act)
+}
+func (a *botApp) getFeaturesForActor(act actor) (publicFeatures, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var out publicFeatures
-	err = a.api.Call(ctx, "GET", "/v1/features", act.TelegramID, nil, &out)
+	err := a.api.Call(ctx, "GET", "/v1/features", act.TelegramID, nil, &out)
 	return out, err
 }
 func featureEnabled(features publicFeatures, key string) bool {
@@ -1658,6 +1671,26 @@ func callbackOperationKey(c telebot.Context, operation, target string) string {
 	return sessionKey(c.Sender().ID, c.Chat().ID, messageID, session, operation, target)
 }
 func sendFailure(c telebot.Context, err error) error {
-	log.Printf("user action failed")
+	status, category := failureDiagnostic(err)
+	log.Printf("user action failed: category=%s status=%d", category, status)
 	return c.Send("درخواست انجام نشد. لطفاً دوباره از منو تلاش کنید یا با پشتیبانی تماس بگیرید.")
+}
+func failureDiagnostic(err error) (int, string) {
+	var apiErr *backend.APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.Code
+		if code == "" {
+			code = "backend_error"
+		}
+		if len(code) > 48 {
+			return apiErr.Status, "backend_error"
+		}
+		for _, r := range code {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+				return apiErr.Status, "backend_error"
+			}
+		}
+		return apiErr.Status, code
+	}
+	return 0, "transport_or_internal"
 }
