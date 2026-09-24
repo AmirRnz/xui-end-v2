@@ -82,6 +82,79 @@ func TestSessionOperationKeyDeduplicatesDeliveryButSeparatesActions(t *testing.T
 	}
 }
 
+func TestTelebotNavCallbackUniqueUsesDecodedUnique(t *testing.T) {
+	if !isNavCallback(&telebot.Callback{Unique: "nav", Data: "nonce|home"}) {
+		t.Fatal("telebot callback handler receives the decoded unique without the leading form-feed")
+	}
+	if isNavCallback(&telebot.Callback{Unique: "\fnav", Data: "nonce|home"}) {
+		t.Fatal("raw callback encoding must not be treated as the decoded unique")
+	}
+}
+
+func TestRegisteredNavRouteDecodesCallbackWithTelebot(t *testing.T) {
+	bot, err := telebot.NewBot(telebot.Settings{Offline: true, Synchronous: true})
+	if err != nil {
+		t.Fatalf("create offline telebot: %v", err)
+	}
+	var gotUnique, gotData string
+	registerCallbackRoutes(bot, func(c telebot.Context) error {
+		gotUnique = c.Callback().Unique
+		gotData = c.Data()
+		return nil
+	})
+
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		Sender: &telebot.User{ID: 41},
+		Data:   "\fnav|nonce|home",
+	}})
+	if gotUnique != "nav" || gotData != "nonce|home" {
+		t.Fatalf("registered nav callback should be decoded, got unique=%q data=%q", gotUnique, gotData)
+	}
+
+	gotUnique, gotData = "", ""
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		Sender: &telebot.User{ID: 41},
+		Data:   "\fother|opaque",
+	}})
+	if gotUnique != "" || gotData != "\fother|opaque" {
+		t.Fatalf("unknown callback should reach fallback without nav decoding, got unique=%q data=%q", gotUnique, gotData)
+	}
+}
+
+func TestCallbackStateCanBeConsumedOnlyOnce(t *testing.T) {
+	app := &botApp{states: make(map[int64]conversation)}
+	app.setState(41, conversation{Step: "purchase-confirm"})
+	initial := app.state(41)
+
+	consumed, ok := app.consumeCallbackState(41, initial.Nonce)
+	if !ok || consumed.Nonce != initial.Nonce || consumed.Step != "purchase-confirm" {
+		t.Fatalf("first callback should consume its current state: %#v, %t", consumed, ok)
+	}
+	rotated := app.state(41)
+	if rotated.Nonce == initial.Nonce {
+		t.Fatal("consuming a callback must rotate the stored nonce")
+	}
+	if _, ok := app.consumeCallbackState(41, initial.Nonce); ok {
+		t.Fatal("redelivered callback must not consume the old nonce twice")
+	}
+}
+
+func TestAdminCommandRequiresConfiguredAdminInPrivateChat(t *testing.T) {
+	admin := &telebot.User{ID: adminTelegramID}
+	if !adminCommandSender(admin, &telebot.Chat{Type: telebot.ChatPrivate}) {
+		t.Fatal("configured administrator should be able to enter /admin privately")
+	}
+	if adminCommandSender(&telebot.User{ID: 41}, &telebot.Chat{Type: telebot.ChatPrivate}) {
+		t.Fatal("ordinary users must not enter the admin command")
+	}
+	if adminCommandSender(admin, &telebot.Chat{Type: telebot.ChatGroup}) {
+		t.Fatal("admin controls must not open in group chats")
+	}
+	if adminCommandSender(nil, &telebot.Chat{Type: telebot.ChatPrivate}) || adminCommandSender(admin, nil) {
+		t.Fatal("missing Telegram identity or chat must deny admin entry")
+	}
+}
+
 func TestSubscriptionPagesExposeEveryLinkAndEmptyLinkSubscription(t *testing.T) {
 	subscriptions := []subscriptionView{
 		{ID: 10, Links: []string{"vless://one", "https://example.test/sub"}},

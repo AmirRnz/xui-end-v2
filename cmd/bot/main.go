@@ -202,9 +202,18 @@ func run() error {
 }
 func (a *botApp) register(b *telebot.Bot) {
 	b.Handle("/start", a.start)
-	b.Handle(telebot.OnCallback, a.callback)
+	b.Handle("/admin", a.adminCommand)
+	registerCallbackRoutes(b, a.callback)
 	b.Handle(telebot.OnText, a.text)
 	b.Handle(telebot.OnPhoto, a.photo)
+}
+
+func registerCallbackRoutes(b *telebot.Bot, handler telebot.HandlerFunc) {
+	// Register the button endpoint so telebot decodes its unique and payload
+	// before invoking the handler. OnCallback remains a fallback for unknown
+	// callback payloads, which are rejected as stale in callback().
+	b.Handle(&telebot.Btn{Unique: "nav"}, handler)
+	b.Handle(telebot.OnCallback, handler)
 }
 
 func newNonce() string {
@@ -241,6 +250,21 @@ func (a *botApp) clearState(user int64) {
 	delete(a.states, user)
 	a.mu.Unlock()
 }
+func (a *botApp) consumeCallbackState(user int64, nonce string) (conversation, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	st, ok := a.states[user]
+	if !ok || nonce == "" || st.Nonce != nonce || time.Since(st.Updated) > 30*time.Minute {
+		return conversation{}, false
+	}
+	// Rotate the stored nonce atomically before routing. Duplicate callback
+	// deliveries and concurrent taps can therefore consume an action only once.
+	consumed := st
+	st.Nonce = newNonce()
+	st.Updated = time.Now()
+	a.states[user] = st
+	return consumed, true
+}
 func (a *botApp) next(st conversation) conversation {
 	st.Nonce = newNonce()
 	st.Updated = time.Now()
@@ -261,6 +285,19 @@ func (a *botApp) start(c telebot.Context) error {
 		return sendFailure(c, err)
 	}
 	return a.home(c, fmt.Sprintf("خوش آمدید. وضعیت حساب: %s", act.ApprovalStatus), false)
+}
+func (a *botApp) adminCommand(c telebot.Context) error {
+	if !adminCommandSender(c.Sender(), c.Chat()) {
+		return c.Send("دسترسی مجاز نیست.")
+	}
+	a.setState(c.Sender().ID, conversation{})
+	return a.adminHome(c, false)
+}
+func adminCommandSender(sender *telebot.User, chat *telebot.Chat) bool {
+	return sender != nil && sender.ID == adminTelegramID && chat != nil && chat.Type == telebot.ChatPrivate
+}
+func isNavCallback(cb *telebot.Callback) bool {
+	return cb != nil && cb.Unique == "nav"
 }
 func (a *botApp) home(c telebot.Context, message string, edit bool) error {
 	st := a.next(conversation{})
@@ -296,9 +333,6 @@ func (a *botApp) homeView(c telebot.Context, message string) (string, *telebot.R
 		rows = append(rows, m.Row(m.Data(menuText(features, "menu_wallet", "👛 موجودی"), "nav", st.Nonce, "wallet"), m.Data(menuText(features, "menu_ledger", "📜 تراکنش‌ها"), "nav", st.Nonce, "ledger")))
 	}
 	rows = append(rows, m.Row(m.Data(menuText(features, "menu_services", "📡 اشتراک‌های من"), "nav", st.Nonce, "services")))
-	if c.Sender().ID == adminTelegramID && act.Role == "admin" {
-		rows = append(rows, m.Row(m.Data("⚙️ مدیریت", "nav", st.Nonce, "admin")))
-	}
 	rows = append(rows, m.Row(m.Data("🔄 خانه", "nav", st.Nonce, "home")))
 	m.Inline(rows...)
 	if custom := strings.TrimSpace(features.Text["welcome"]); custom != "" && (message == "صفحه اصلی" || strings.HasPrefix(message, "خوش آمدید")) {
@@ -355,7 +389,7 @@ func (a *botApp) callback(c telebot.Context) error {
 	if cb == nil || c.Sender() == nil {
 		return nil
 	}
-	if cb.Unique != "\fnav" {
+	if !isNavCallback(cb) {
 		if err := c.Respond(&telebot.CallbackResponse{Text: "این گزینه منقضی شد.", ShowAlert: true}); err != nil {
 			log.Printf("callback acknowledgement failed")
 		}
@@ -368,8 +402,8 @@ func (a *botApp) callback(c telebot.Context) error {
 		}
 		return a.freshHome(c, "از منوی تازه ادامه دهید.")
 	}
-	st := a.state(c.Sender().ID)
-	if fields[0] != st.Nonce {
+	st, ok := a.consumeCallbackState(c.Sender().ID, fields[0])
+	if !ok {
 		if err := c.Respond(&telebot.CallbackResponse{Text: "صفحه به‌روز شد.", ShowAlert: true}); err != nil {
 			log.Printf("callback acknowledgement failed")
 		}
@@ -378,15 +412,8 @@ func (a *botApp) callback(c telebot.Context) error {
 	if err := c.Respond(); err != nil {
 		log.Printf("callback acknowledgement failed: %v", err)
 	}
-	a.setState(c.Sender().ID, st)
-	st = a.state(c.Sender().ID)
-	a.mu.Lock()
-	stored := a.states[c.Sender().ID]
-	a.mu.Unlock()
-	// Keep this callback's token until its action renders a fresh screen.
-	stored.Nonce = fields[0]
 	command, args := fields[1], fields[2:]
-	return a.route(c, command, args, stored)
+	return a.route(c, command, args, st)
 }
 func (a *botApp) route(c telebot.Context, action string, args []string, st conversation) error {
 	switch action {
