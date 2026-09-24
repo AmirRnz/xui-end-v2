@@ -24,6 +24,10 @@ func fakeTelegramServer(t *testing.T, capture func(string, map[string]any)) *htt
 		if capture != nil {
 			capture(method, body)
 		}
+		if method == "sendPhoto" {
+			_, _ = fmt.Fprint(w, `{"ok":true,"result":{"message_id":99,"date":1,"chat":{"id":42,"type":"private"},"photo":[{"file_id":"returned-file","file_unique_id":"returned-unique","width":1,"height":1}],"caption":"ok"}}`)
+			return
+		}
 		if method == "getMe" {
 			_, _ = fmt.Fprint(w, `{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"test","username":"test"}}`)
 			return
@@ -337,6 +341,179 @@ func TestTopupShowsBackendPaymentInstructionsAndMinimum(t *testing.T) {
 	}
 	if !strings.Contains(sentText, "حداقل مبلغ شارژ") {
 		t.Fatalf("below-minimum prompt missing: %s", sentText)
+	}
+}
+
+func TestStartResumesActivePaymentAndTopup(t *testing.T) {
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":42,"role":"customer"}`))
+		case "/v1/payment-intents/active":
+			_, _ = w.Write([]byte(`{"payment_intent":{"id":17,"status":"awaiting_receipt","amount_toman":120000}}`))
+		case "/v1/wallet/topups/active":
+			_, _ = w.Write([]byte(`{"topup":{"id":23,"status":"awaiting_receipt","amount_toman":75000}}`))
+		default:
+			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+	var sent map[string]any
+	tg := fakeTelegramServer(t, func(method string, body map[string]any) {
+		if method == "sendMessage" {
+			sent = body
+		}
+	})
+	defer tg.Close()
+	bot, err := telebot.NewBot(telebot.Settings{Token: "test-token", URL: tg.URL, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	app.register(bot)
+	bot.ProcessUpdate(telebot.Update{Message: &telebot.Message{
+		ID: 7, Sender: &telebot.User{ID: 42}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}, Text: "/start",
+	}})
+	if sent == nil || !strings.Contains(fmt.Sprint(sent["text"]), "بدون رسید") {
+		t.Fatalf("start did not offer receipt recovery: %#v", sent)
+	}
+	markup := requestMarkup(t, sent)
+	encoded, _ := json.Marshal(markup)
+	for _, want := range []string{"resume-payment", "resume-topup", "17", "23", "home"} {
+		if !strings.Contains(string(encoded), want) {
+			t.Fatalf("resume menu missing %q: %s", want, encoded)
+		}
+	}
+}
+
+func TestPhotoWithoutLocalStateResumesActivePaymentIntent(t *testing.T) {
+	var receiptPosts int
+	var receivedFileID string
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":42,"role":"customer"}`))
+		case "/v1/payment-intents/active":
+			_, _ = w.Write([]byte(`{"payment_intent":{"id":17,"status":"awaiting_receipt","amount_toman":120000}}`))
+		case "/v1/wallet/topups/active":
+			_, _ = w.Write([]byte(`{"topup":null}`))
+		case "/v1/payment-intents/17/receipt":
+			receiptPosts++
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode receipt body: %v", err)
+			}
+			receivedFileID = body["telegram_file_id"]
+			_, _ = w.Write([]byte(`{"payment_intent_id":17,"status":"receipt_submitted"}`))
+		case "/v1/features":
+			_, _ = w.Write([]byte(`{"features":{},"text":{}}`))
+		default:
+			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+	tg := fakeTelegramServer(t, nil)
+	defer tg.Close()
+	bot, err := telebot.NewBot(telebot.Settings{Token: "test-token", URL: tg.URL, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	ctx := bot.NewContext(telebot.Update{Message: &telebot.Message{
+		ID: 8, Sender: &telebot.User{ID: 42}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate},
+		Photo: &telebot.Photo{File: telebot.File{FileID: "receipt-photo"}},
+	}})
+	if err = app.photo(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if receiptPosts != 1 || receivedFileID != "receipt-photo" {
+		t.Fatalf("receipt recovery post count/file = %d/%q, want 1/receipt-photo", receiptPosts, receivedFileID)
+	}
+}
+
+func TestAdminReceiptViewAndConfirmedRejectUsePrivateBackendRoutes(t *testing.T) {
+	var rejected int
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":96937669,"role":"admin"}`))
+		case "/v1/admin/config":
+			_, _ = w.Write([]byte(`{"channel":"retail-finland"}`))
+		case "/v1/admin/payments":
+			_, _ = w.Write([]byte(`[{"id":12,"telegram_id":42,"amount_toman":120000,"status":"receipt_submitted","telegram_file_id":"evidence-file"}]`))
+		case "/v1/payment-intents/12/reject":
+			if r.Method != http.MethodPost {
+				t.Errorf("reject method = %s, want POST", r.Method)
+			}
+			rejected++
+			_, _ = w.Write([]byte(`{"payment_intent_id":12,"status":"rejected","already_rejected":false}`))
+		default:
+			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+	var photoFileID string
+	var photoCaption string
+	var lastMarkup map[string]any
+	tg := fakeTelegramServer(t, func(method string, body map[string]any) {
+		if method == "sendPhoto" {
+			photoFileID, _ = body["photo"].(string)
+			photoCaption, _ = body["caption"].(string)
+		}
+		if method == "editMessageText" || method == "sendMessage" {
+			lastMarkup = requestMarkup(t, body)
+		}
+	})
+	defer tg.Close()
+	bot, err := telebot.NewBot(telebot.Settings{Token: "test-token", URL: tg.URL, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	app.register(bot)
+	app.setState(adminTelegramID, conversation{})
+	adminMessage := &telebot.Message{ID: 99, Sender: &telebot.User{}, Chat: &telebot.Chat{ID: adminTelegramID, Type: telebot.ChatPrivate}}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "view-receipt", Sender: &telebot.User{ID: adminTelegramID},
+		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|view-payment-receipt|12", Message: adminMessage,
+	}})
+	if photoFileID != "evidence-file" {
+		t.Fatalf("admin receipt photo file_id = %q, want evidence-file", photoFileID)
+	}
+	if !strings.Contains(photoCaption, "42") {
+		t.Fatalf("admin receipt caption lacks customer Telegram ID: %q", photoCaption)
+	}
+	if lastMarkup == nil {
+		t.Fatal("receipt view did not include approve/reject controls")
+	}
+	encoded, _ := json.Marshal(lastMarkup)
+	if !strings.Contains(string(encoded), "reject-payment") {
+		t.Fatalf("receipt action menu lacks reject button: %s", encoded)
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "reject-confirmation", Sender: &telebot.User{ID: adminTelegramID},
+		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|reject-payment|12", Message: adminMessage,
+	}})
+	encoded, _ = json.Marshal(lastMarkup)
+	if !strings.Contains(string(encoded), "confirm-reject-payment") {
+		t.Fatalf("reject action did not require confirmation: %s", encoded)
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "reject-confirmed", Sender: &telebot.User{ID: adminTelegramID},
+		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|confirm-reject-payment|12", Message: adminMessage,
+	}})
+	if rejected != 1 {
+		t.Fatalf("payment reject calls=%d, want one", rejected)
+	}
+	group := bot.NewContext(telebot.Update{Message: &telebot.Message{Sender: &telebot.User{ID: adminTelegramID}, Chat: &telebot.Chat{ID: -9, Type: telebot.ChatGroup}}})
+	if _, err = app.requireRetailAdmin(group); err == nil {
+		t.Fatal("admin access was allowed from a group chat")
 	}
 }
 

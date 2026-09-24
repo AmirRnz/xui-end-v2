@@ -111,25 +111,38 @@ type receiptState struct {
 	Kind string
 	ID   int64
 }
+type activeReceiptRequest struct {
+	ID        int64  `json:"id"`
+	Status    string `json:"status"`
+	Amount    int64  `json:"amount_toman"`
+	CreatedAt string `json:"created_at"`
+}
+type activePaymentIntentResponse struct {
+	PaymentIntent *activeReceiptRequest `json:"payment_intent"`
+}
+type activeTopupResponse struct {
+	Topup *activeReceiptRequest `json:"topup"`
+}
 type conversation struct {
-	Nonce        string
-	Step         string
-	PlanID       int64
-	Method       string
-	Months       int
-	IPLimit      int
-	DataGB       int
-	Name         string
-	Receipt      *receiptState
-	Admin        string
-	AdminID      int64
-	PanelURL     string
-	Draft        *adminPlan
-	OperationKey string
-	QuoteID      int64
-	QuotePrice   int64
-	RefundSubID  int64
-	Updated      time.Time
+	Nonce              string
+	Step               string
+	PlanID             int64
+	Method             string
+	Months             int
+	IPLimit            int
+	DataGB             int
+	Name               string
+	Receipt            *receiptState
+	ReceiptPhotoFileID string
+	Admin              string
+	AdminID            int64
+	PanelURL           string
+	Draft              *adminPlan
+	OperationKey       string
+	QuoteID            int64
+	QuotePrice         int64
+	RefundSubID        int64
+	Updated            time.Time
 }
 type adminPlan struct {
 	ID                 int64   `json:"id,omitempty"`
@@ -306,11 +319,110 @@ func (a *botApp) resolve(c telebot.Context) (actor, error) {
 }
 func (a *botApp) start(c telebot.Context) error {
 	a.clearState(c.Sender().ID)
-	_, err := a.resolve(c)
+	act, err := a.resolve(c)
 	if err != nil {
 		return sendFailure(c, err)
 	}
+	if resumed, resumeErr := a.resumeReceiptMenu(c, act); resumeErr == nil && resumed {
+		return nil
+	} else if resumeErr != nil {
+		log.Printf("active receipt lookup failed: category=backend")
+	}
 	return a.home(c, "👋 به پنل کاربری خوش آمدید\nسرویس وی‌پی‌ان خود را مدیریت کنید یا سرویس جدید خریداری نمایید.", false)
+}
+
+func (a *botApp) activeReceipts(c telebot.Context, act actor) (*activeReceiptRequest, *activeReceiptRequest, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var payment activePaymentIntentResponse
+	if err := a.api.Call(ctx, "GET", "/v1/payment-intents/active", act.TelegramID, nil, &payment); err != nil {
+		return nil, nil, err
+	}
+	var topup activeTopupResponse
+	if err := a.api.Call(ctx, "GET", "/v1/wallet/topups/active", act.TelegramID, nil, &topup); err != nil {
+		return nil, nil, err
+	}
+	return payment.PaymentIntent, topup.Topup, nil
+}
+
+func (a *botApp) resumeReceiptMenu(c telebot.Context, act actor) (bool, error) {
+	payment, topup, err := a.activeReceipts(c, act)
+	if err != nil {
+		return false, err
+	}
+	var awaiting []receiptState
+	var status []string
+	if payment != nil {
+		if payment.Status == "awaiting_receipt" {
+			awaiting = append(awaiting, receiptState{Kind: "payment", ID: payment.ID})
+		} else if payment.Status == "receipt_submitted" {
+			status = append(status, fmt.Sprintf("رسید پرداخت مستقیم #%d به مبلغ %s تومان در انتظار بررسی مدیریت است.", payment.ID, formatToman(payment.Amount)))
+		}
+	}
+	if topup != nil {
+		if topup.Status == "awaiting_receipt" {
+			awaiting = append(awaiting, receiptState{Kind: "topup", ID: topup.ID})
+		} else if topup.Status == "receipt_submitted" {
+			status = append(status, fmt.Sprintf("رسید شارژ کیف پول #%d به مبلغ %s تومان در انتظار بررسی مدیریت است.", topup.ID, formatToman(topup.Amount)))
+		}
+	}
+	if len(awaiting) == 0 && len(status) == 0 {
+		return false, nil
+	}
+	if len(awaiting) == 0 {
+		return true, a.home(c, strings.Join(status, "\n")+"\n\nصفحه اصلی", false)
+	}
+	selected := awaiting[0]
+	a.setState(c.Sender().ID, conversation{Receipt: &receiptState{Kind: selected.Kind, ID: selected.ID}, Step: "receipt-photo"})
+	st := a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	rows := make([]telebot.Row, 0, len(awaiting)+1)
+	for _, receipt := range awaiting {
+		label := fmt.Sprintf("📷 ادامه ارسال رسید پرداخت #%d", receipt.ID)
+		action := "resume-payment"
+		if receipt.Kind == "topup" {
+			label = fmt.Sprintf("📷 ادامه ارسال رسید شارژ #%d", receipt.ID)
+			action = "resume-topup"
+		}
+		rows = append(rows, m.Row(m.Data(label, "nav", st.Nonce, action, strconv.FormatInt(receipt.ID, 10))))
+	}
+	rows = append(rows, m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
+	m.Inline(rows...)
+	message := "یک درخواست پرداخت بدون رسید پیدا شد. برای ادامه، درخواست را انتخاب کنید و سپس عکس رسید را بفرستید."
+	if len(status) > 0 {
+		message = strings.Join(status, "\n") + "\n\n" + message
+	}
+	return true, c.Send(message, m)
+}
+
+func (a *botApp) resumeReceipt(c telebot.Context, kind string, args []string, st conversation) error {
+	if len(args) != 1 {
+		return a.freshHome(c, "درخواست رسید نامعتبر است.")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id <= 0 {
+		return a.freshHome(c, "درخواست رسید نامعتبر است.")
+	}
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	payment, topup, err := a.activeReceipts(c, act)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	active := payment
+	if kind == "topup" {
+		active = topup
+	}
+	if active == nil || active.ID != id || active.Status != "awaiting_receipt" {
+		return a.freshHome(c, "این درخواست دیگر منتظر رسید نیست.")
+	}
+	a.setState(c.Sender().ID, conversation{Receipt: &receiptState{Kind: kind, ID: id}, Step: "receipt-photo"})
+	if st.ReceiptPhotoFileID != "" {
+		return a.submitReceipt(c, receiptState{Kind: kind, ID: id}, st.ReceiptPhotoFileID)
+	}
+	return a.prompt(c, "عکس رسید را ارسال کنید.", true)
 }
 func (a *botApp) adminCommand(c telebot.Context) error {
 	if !adminCommandSender(c.Sender(), c.Chat()) {
@@ -695,12 +807,42 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 		st = a.next(st)
 		a.setState(c.Sender().ID, st)
 		return a.prompt(c, "عکس رسید را ارسال کنید.", true)
+	case "resume-payment", "resume-topup":
+		kind := "payment"
+		if action == "resume-topup" {
+			kind = "topup"
+		}
+		return a.resumeReceipt(c, kind, args, st)
 	case "admin":
 		return a.adminHome(c, true)
 	case "pending-payments":
 		return a.pending(c, true)
 	case "pending-topups":
 		return a.pendingTopups(c, true)
+	case "view-payment-receipt", "view-topup-receipt":
+		kind := "payment"
+		if action == "view-topup-receipt" {
+			kind = "topup"
+		}
+		return a.viewPendingReceipt(c, kind, args)
+	case "reject-payment", "reject-topup", "reject-refund":
+		kind := strings.TrimPrefix(action, "reject-")
+		return a.confirmReject(c, kind, args)
+	case "confirm-reject-payment", "confirm-reject-topup", "confirm-reject-refund":
+		kind := strings.TrimPrefix(action, "confirm-reject-")
+		return a.rejectAdminItem(c, kind, args, true)
+	case "cancel-reject-payment":
+		return a.pending(c, true)
+	case "cancel-reject-topup":
+		return a.pendingTopups(c, true)
+	case "cancel-reject-refund":
+		if len(args) == 1 {
+			id, e := strconv.ParseInt(args[0], 10, 64)
+			if e == nil && id > 0 {
+				return a.reviewRefund(c, id, true)
+			}
+		}
+		return a.pendingRefunds(c, true)
 	case "pending-refunds":
 		return a.pendingRefunds(c, true)
 	case "review-refund":
@@ -1387,24 +1529,67 @@ func hasPaymentDestination(instruction map[string]any) bool {
 }
 func (a *botApp) photo(c telebot.Context) error {
 	st := a.state(c.Sender().ID)
-	if st.Receipt == nil {
-		return c.Send("ابتدا از منو خرید یا شارژ را انجام دهید تا درخواست رسید ایجاد شود.")
-	}
-	act, err := a.resolve(c)
-	if err != nil {
-		return sendFailure(c, err)
-	}
 	msg := c.Message()
 	if msg == nil || msg.Photo == nil {
 		return c.Send("عکس رسید دریافت نشد.")
 	}
-	path := fmt.Sprintf("/v1/payment-intents/%d/receipt", st.Receipt.ID)
-	if st.Receipt.Kind == "topup" {
-		path = fmt.Sprintf("/v1/wallet/topups/%d/receipt", st.Receipt.ID)
+	if st.Receipt == nil {
+		act, err := a.resolve(c)
+		if err != nil {
+			return sendFailure(c, err)
+		}
+		payment, topup, err := a.activeReceipts(c, act)
+		if err != nil {
+			return sendFailure(c, err)
+		}
+		var awaiting []receiptState
+		if payment != nil && payment.Status == "awaiting_receipt" {
+			awaiting = append(awaiting, receiptState{Kind: "payment", ID: payment.ID})
+		}
+		if topup != nil && topup.Status == "awaiting_receipt" {
+			awaiting = append(awaiting, receiptState{Kind: "topup", ID: topup.ID})
+		}
+		if len(awaiting) == 0 {
+			if payment != nil && payment.Status == "receipt_submitted" || topup != nil && topup.Status == "receipt_submitted" {
+				return a.home(c, "رسید قبلی شما در انتظار بررسی مدیریت است.", false)
+			}
+			return c.Send("درخواست فعالی برای ارسال رسید پیدا نشد. ابتدا خرید یا شارژ را شروع کنید.")
+		}
+		if len(awaiting) == 1 {
+			return a.submitReceipt(c, awaiting[0], msg.Photo.FileID)
+		}
+		a.setState(c.Sender().ID, conversation{Receipt: &awaiting[0], Step: "receipt-choice", ReceiptPhotoFileID: msg.Photo.FileID})
+		st = a.state(c.Sender().ID)
+		m := &telebot.ReplyMarkup{}
+		rows := make([]telebot.Row, 0, len(awaiting)+1)
+		for _, receipt := range awaiting {
+			label, action := fmt.Sprintf("ارسال به پرداخت #%d", receipt.ID), "resume-payment"
+			if receipt.Kind == "topup" {
+				label, action = fmt.Sprintf("ارسال به شارژ #%d", receipt.ID), "resume-topup"
+			}
+			rows = append(rows, m.Row(m.Data(label, "nav", st.Nonce, action, strconv.FormatInt(receipt.ID, 10))))
+		}
+		rows = append(rows, m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
+		m.Inline(rows...)
+		return c.Send("دو درخواست منتظر رسید دارید. این عکس را به کدام درخواست پیوند بدهم؟", m)
+	}
+	return a.submitReceipt(c, *st.Receipt, msg.Photo.FileID)
+}
+
+func (a *botApp) submitReceipt(c telebot.Context, receipt receiptState, fileID string) error {
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	path := fmt.Sprintf("/v1/payment-intents/%d/receipt", receipt.ID)
+	if receipt.Kind == "topup" {
+		path = fmt.Sprintf("/v1/wallet/topups/%d/receipt", receipt.ID)
+	} else if receipt.Kind != "payment" {
+		return c.Send("نوع درخواست رسید نامعتبر است.")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err = a.api.Call(ctx, "POST", path, act.TelegramID, map[string]any{"telegram_file_id": msg.Photo.FileID}, nil); err != nil {
+	if err = a.api.Call(ctx, "POST", path, act.TelegramID, map[string]any{"telegram_file_id": fileID}, nil); err != nil {
 		return sendFailure(c, err)
 	}
 	a.clearState(c.Sender().ID)
@@ -1605,6 +1790,14 @@ type refundRequestView struct {
 	Reason               string `json:"reason"`
 }
 
+type pendingReceiptView struct {
+	ID             int64  `json:"id"`
+	TelegramID     int64  `json:"telegram_id"`
+	Amount         int64  `json:"amount_toman"`
+	Status         string `json:"status"`
+	TelegramFileID string `json:"telegram_file_id"`
+}
+
 func (a *botApp) pendingRefunds(c telebot.Context, edit bool) error {
 	act, err := a.requireRetailAdmin(c)
 	if err != nil {
@@ -1666,6 +1859,7 @@ func (a *botApp) reviewRefund(c telebot.Context, id int64, edit bool) error {
 	if item.RefundableCapToman > 0 && item.SuggestedAmountToman > 0 {
 		rows = append(rows, m.Row(m.Data("✅ تأیید مبلغ پیشنهادی", "nav", st.Nonce, "approve-refund", strconv.FormatInt(item.ID, 10))))
 	}
+	rows = append(rows, m.Row(m.Data("❌ رد درخواست بازپرداخت", "nav", st.Nonce, "reject-refund", strconv.FormatInt(item.ID, 10))))
 	rows = append(rows, m.Row(m.Data("↩️ بازپرداخت‌ها", "nav", st.Nonce, "pending-refunds")))
 	m.Inline(rows...)
 	text := fmt.Sprintf("بازپرداخت #%d برای سرویس #%d\nدرخواست: %s تومان\nسقف از شرایط خرید ثبت‌شده: %s تومان\nدلیل مشتری: %s\n\nتأیید فقط پس از لغو تأییدشده سرویس انجام می‌شود.", item.ID, item.SubscriptionID, formatToman(item.SuggestedAmountToman), formatToman(item.RefundableCapToman), item.Reason)
@@ -1727,7 +1921,7 @@ func (a *botApp) pending(c telebot.Context, edit bool) error {
 	if err != nil {
 		return sendFailure(c, err)
 	}
-	var out []map[string]any
+	var out []pendingReceiptView
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err = a.api.Call(ctx, "GET", "/v1/admin/payments", act.TelegramID, nil, &out); err != nil {
@@ -1744,9 +1938,12 @@ func (a *botApp) pending(c telebot.Context, edit bool) error {
 	}
 	var b strings.Builder
 	for _, p := range out {
-		id := fmt.Sprint(p["id"])
-		fmt.Fprintf(&b, "پرداخت %s — %v تومان\n", id, p["amount_toman"])
-		rows = append(rows, m.Row(m.Data("تأیید پرداخت "+id, "nav", st.Nonce, "approve-payment", id)))
+		id := strconv.FormatInt(p.ID, 10)
+		fmt.Fprintf(&b, "پرداخت %s — %s تومان\n", id, formatToman(p.Amount))
+		rows = append(rows,
+			m.Row(m.Data("📷 رسید پرداخت "+id, "nav", st.Nonce, "view-payment-receipt", id)),
+			m.Row(m.Data("✅ تأیید", "nav", st.Nonce, "approve-payment", id), m.Data("❌ رد", "nav", st.Nonce, "reject-payment", id)),
+		)
 	}
 	rows = append(rows, m.Row(m.Data("↩️ مدیریت", "nav", st.Nonce, "admin")))
 	m.Inline(rows...)
@@ -1757,7 +1954,7 @@ func (a *botApp) pendingTopups(c telebot.Context, edit bool) error {
 	if err != nil {
 		return sendFailure(c, err)
 	}
-	var out []map[string]any
+	var out []pendingReceiptView
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err = a.api.Call(ctx, "GET", "/v1/admin/topups", act.TelegramID, nil, &out); err != nil {
@@ -1774,14 +1971,165 @@ func (a *botApp) pendingTopups(c telebot.Context, edit bool) error {
 	}
 	var b strings.Builder
 	for _, p := range out {
-		id := fmt.Sprint(p["id"])
-		fmt.Fprintf(&b, "شارژ %s — %v تومان\n", id, p["amount_toman"])
-		rows = append(rows, m.Row(m.Data("تأیید شارژ "+id, "nav", st.Nonce, "approve-topup", id)))
+		id := strconv.FormatInt(p.ID, 10)
+		fmt.Fprintf(&b, "شارژ %s — %s تومان\n", id, formatToman(p.Amount))
+		rows = append(rows,
+			m.Row(m.Data("📷 رسید شارژ "+id, "nav", st.Nonce, "view-topup-receipt", id)),
+			m.Row(m.Data("✅ تأیید", "nav", st.Nonce, "approve-topup", id), m.Data("❌ رد", "nav", st.Nonce, "reject-topup", id)),
+		)
 	}
 	rows = append(rows, m.Row(m.Data("↩️ مدیریت", "nav", st.Nonce, "admin")))
 	m.Inline(rows...)
 	return present(c, strings.TrimSpace(b.String()), m, edit)
 }
+
+func (a *botApp) loadPendingReceipt(c telebot.Context, kind string, id int64) (pendingReceiptView, error) {
+	act, err := a.requireRetailAdmin(c)
+	if err != nil {
+		return pendingReceiptView{}, err
+	}
+	path := "/v1/admin/payments"
+	if kind == "topup" {
+		path = "/v1/admin/topups"
+	} else if kind != "payment" {
+		return pendingReceiptView{}, fmt.Errorf("invalid receipt type")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var items []pendingReceiptView
+	if err = a.api.Call(ctx, "GET", path, act.TelegramID, nil, &items); err != nil {
+		return pendingReceiptView{}, err
+	}
+	for _, item := range items {
+		if item.ID == id {
+			if item.TelegramFileID == "" || item.Status != "receipt_submitted" {
+				return pendingReceiptView{}, fmt.Errorf("receipt evidence is unavailable")
+			}
+			return item, nil
+		}
+	}
+	return pendingReceiptView{}, fmt.Errorf("receipt is no longer pending")
+}
+
+func parseAdminItemID(args []string) (int64, error) {
+	if len(args) != 1 {
+		return 0, fmt.Errorf("invalid request")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("invalid request")
+	}
+	return id, nil
+}
+
+func (a *botApp) viewPendingReceipt(c telebot.Context, kind string, args []string) error {
+	id, err := parseAdminItemID(args)
+	if err != nil {
+		return a.adminMenuMessage(c, "شناسه رسید نامعتبر است.", true)
+	}
+	item, err := a.loadPendingReceipt(c, kind, id)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	label := "پرداخت مستقیم"
+	if kind == "topup" {
+		label = "شارژ کیف پول"
+	}
+	caption := fmt.Sprintf("رسید %s #%d — %s تومان", label, item.ID, formatToman(item.Amount))
+	if item.TelegramID > 0 {
+		caption += fmt.Sprintf("\nکاربر تلگرام: %d", item.TelegramID)
+	}
+	if err = c.Send(&telebot.Photo{File: telebot.File{FileID: item.TelegramFileID}, Caption: caption}); err != nil {
+		log.Printf("admin receipt image delivery failed: category=telegram")
+		return err
+	}
+	st := a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	approve, reject, back := "approve-payment", "reject-payment", "pending-payments"
+	if kind == "topup" {
+		approve, reject, back = "approve-topup", "reject-topup", "pending-topups"
+	}
+	m.Inline(
+		m.Row(m.Data("✅ تأیید", "nav", st.Nonce, approve, strconv.FormatInt(item.ID, 10)), m.Data("❌ رد", "nav", st.Nonce, reject, strconv.FormatInt(item.ID, 10))),
+		m.Row(m.Data("↩️ بازگشت", "nav", st.Nonce, back)),
+	)
+	return c.Send(caption+"\nبرای رد کردن ابتدا تأیید می‌کنید؟", m)
+}
+
+func (a *botApp) confirmReject(c telebot.Context, kind string, args []string) error {
+	id, err := parseAdminItemID(args)
+	if err != nil {
+		return a.adminMenuMessage(c, "شناسه درخواست نامعتبر است.", true)
+	}
+	if kind == "refund" {
+		if _, err = a.loadPendingRefund(c, id); err != nil {
+			return sendFailure(c, err)
+		}
+	} else if _, err = a.loadPendingReceipt(c, kind, id); err != nil {
+		return sendFailure(c, err)
+	}
+	st := a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	confirm := "confirm-reject-" + kind
+	cancel := "cancel-reject-" + kind
+	var cancelArgs []string
+	if kind == "refund" {
+		cancelArgs = append(cancelArgs, strconv.FormatInt(id, 10))
+	}
+	rows := []telebot.Row{
+		m.Row(m.Data("بله، رد شود", "nav", st.Nonce, confirm, strconv.FormatInt(id, 10))),
+	}
+	cancelData := append([]string{st.Nonce, cancel}, cancelArgs...)
+	rows = append(rows, m.Row(m.Data("لغو", "nav", cancelData...)))
+	m.Inline(rows...)
+	return present(c, fmt.Sprintf("رد %s #%d را تأیید می‌کنید؟ این تصمیم برای مشتری ثبت و به او اطلاع داده می‌شود.", kindLabel(kind), id), m, true)
+}
+
+func kindLabel(kind string) string {
+	switch kind {
+	case "payment":
+		return "پرداخت"
+	case "topup":
+		return "درخواست شارژ"
+	case "refund":
+		return "درخواست بازپرداخت"
+	default:
+		return "درخواست"
+	}
+}
+
+func (a *botApp) rejectAdminItem(c telebot.Context, kind string, args []string, edit bool) error {
+	id, err := parseAdminItemID(args)
+	if err != nil {
+		return a.adminMenuMessage(c, "شناسه درخواست نامعتبر است.", edit)
+	}
+	act, err := a.requireRetailAdmin(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	path := ""
+	switch kind {
+	case "payment":
+		path = fmt.Sprintf("/v1/payment-intents/%d/reject", id)
+	case "topup":
+		path = fmt.Sprintf("/v1/admin/topups/%d/reject", id)
+	case "refund":
+		path = fmt.Sprintf("/v1/admin/refunds/%d/reject", id)
+	default:
+		return a.adminMenuMessage(c, "نوع درخواست نامعتبر است.", edit)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var out struct {
+		Status          string `json:"status"`
+		AlreadyRejected bool   `json:"already_rejected"`
+	}
+	if err = a.api.Call(ctx, "POST", path, act.TelegramID, map[string]any{}, &out); err != nil {
+		return sendFailure(c, err)
+	}
+	return a.adminMenuMessage(c, fmt.Sprintf("%s #%d رد شد.", kindLabel(kind), id), edit)
+}
+
 func (a *botApp) adminMenuMessage(c telebot.Context, text string, edit bool) error {
 	st := a.state(c.Sender().ID)
 	m := &telebot.ReplyMarkup{}
@@ -1825,6 +2173,9 @@ func (a *botApp) adminConfig(c telebot.Context, edit bool) error {
 	return present(c, fmt.Sprintf("پیکربندی %s | شناسه استقرار: %s", cfg.Channel, cfg.DeploymentID), m, edit)
 }
 func (a *botApp) requireAdmin(c telebot.Context) (actor, error) {
+	if c.Chat() == nil || c.Chat().Type != telebot.ChatPrivate {
+		return actor{}, fmt.Errorf("مدیریت فقط در گفت‌وگوی خصوصی در دسترس است")
+	}
 	act, err := a.resolve(c)
 	if err != nil {
 		return act, err
