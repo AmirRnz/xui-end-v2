@@ -6,12 +6,47 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"example.com/xui-end-bot-v2/internal/backend"
 	"gopkg.in/telebot.v3"
 )
+
+func fakeTelegramServer(t *testing.T, capture func(string, map[string]any)) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		if capture != nil {
+			capture(method, body)
+		}
+		if method == "getMe" {
+			_, _ = fmt.Fprint(w, `{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"test","username":"test"}}`)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"ok":true,"result":{"message_id":99,"date":1,"chat":{"id":42,"type":"private"},"text":"ok"}}`)
+	}))
+}
+
+func requestMarkup(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+	switch value := body["reply_markup"].(type) {
+	case string:
+		var markup map[string]any
+		if err := json.Unmarshal([]byte(value), &markup); err != nil {
+			t.Fatalf("decode Telegram reply markup: %v", err)
+		}
+		return markup
+	case map[string]any:
+		return value
+	default:
+		return nil
+	}
+}
 
 func testBackend(t *testing.T, handler http.HandlerFunc) (*backend.Client, *httptest.Server) {
 	t.Helper()
@@ -155,5 +190,254 @@ func TestRetailHomeHidesBackendDisabledLegacyActions(t *testing.T) {
 	data, _ := json.Marshal(markup.InlineKeyboard)
 	if strings.Contains(string(data), "plans-paid") || strings.Contains(string(data), "plans-test") || strings.Contains(string(data), "wallet") {
 		t.Fatalf("disabled retail features appeared on home: %s", data)
+	}
+}
+
+func TestPurchaseRequiresVisibleQuoteAndExplicitConfirmation(t *testing.T) {
+	var mu sync.Mutex
+	quoteCalls, purchaseCalls := 0, 0
+	var purchaseBody map[string]any
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":42,"role":"customer"}`))
+		case "/v1/features":
+			_, _ = w.Write([]byte(`{"features":{},"text":{}}`))
+		case "/v1/quotes":
+			mu.Lock()
+			quoteCalls++
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":77,"plan_name":"ماهیانه","months":3,"duration_days":90,"ip_limit":2,"data_gb":20,"base_price_toman":90000,"extra_ip_price_toman":10000,"extra_month_price_toman":0,"traffic_price_toman":20000,"discount_toman":5000,"final_price_toman":115000,"currency":"تومان"}`))
+		case "/v1/wallet":
+			_, _ = w.Write([]byte(`{"balance_toman":150000,"currency":"تومان"}`))
+		case "/v1/purchases":
+			mu.Lock()
+			purchaseCalls++
+			_ = json.NewDecoder(r.Body).Decode(&purchaseBody)
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"order_id":11,"status":"provisioning","amount_toman":115000}`))
+		default:
+			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+	var sentInvoice map[string]any
+	telegramServer := fakeTelegramServer(t, func(method string, body map[string]any) {
+		if method == "sendMessage" {
+			sentInvoice = body
+		}
+	})
+	defer telegramServer.Close()
+	bot, err := telebot.NewBot(telebot.Settings{Token: "test-token", URL: telegramServer.URL, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	app.register(bot)
+	app.setState(42, conversation{PlanID: 7, Months: 3, IPLimit: 2, DataGB: 20, Name: "customer", Method: "wallet", OperationKey: "purchase-test-key"})
+	ctx := bot.NewContext(telebot.Update{Message: &telebot.Message{ID: 7, Sender: &telebot.User{ID: 42}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}}})
+	if err = app.showInvoice(ctx, app.state(42), false); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	gotQuotes, gotPurchases := quoteCalls, purchaseCalls
+	mu.Unlock()
+	if gotQuotes != 1 || gotPurchases != 0 {
+		t.Fatalf("before explicit confirmation, quotes/purchases = %d/%d, want 1/0", gotQuotes, gotPurchases)
+	}
+	text, _ := sentInvoice["text"].(string)
+	for _, want := range []string{"طرح:", "customer", "3 ماه", "90 روز", "IP هم‌زمان: 2", "20 گیگابایت", "115,000 تومان", "تخفیف: 5,000 تومان", "موجودی کیف پول: 150,000 تومان"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("invoice missing %q: %s", want, text)
+		}
+	}
+	markup := requestMarkup(t, sentInvoice)
+	if markup == nil {
+		t.Fatal("invoice has no payment buttons")
+	}
+	rows, _ := markup["inline_keyboard"].([]any)
+	if len(rows) == 0 {
+		t.Fatal("invoice has no inline keyboard rows")
+	}
+	var walletCallback string
+	for _, rawRow := range rows {
+		row, _ := rawRow.([]any)
+		for _, rawButton := range row {
+			button, _ := rawButton.(map[string]any)
+			if button["text"] == "👛 پرداخت از کیف پول" {
+				walletCallback, _ = button["callback_data"].(string)
+			}
+		}
+	}
+	if walletCallback == "" {
+		t.Fatal("invoice lacks the wallet confirmation button")
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{ID: "confirm", Sender: &telebot.User{ID: 42}, Data: walletCallback, Message: &telebot.Message{ID: 99, Sender: &telebot.User{}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}}}})
+	mu.Lock()
+	defer mu.Unlock()
+	if purchaseCalls != 1 {
+		t.Fatalf("confirmed invoice caused %d purchases, want one", purchaseCalls)
+	}
+	if purchaseBody["quote_id"] != float64(77) || purchaseBody["payment_method"] != "wallet" {
+		t.Fatalf("purchase did not consume displayed immutable quote: %#v", purchaseBody)
+	}
+}
+
+func TestTopupShowsBackendPaymentInstructionsAndMinimum(t *testing.T) {
+	var created int
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":42,"role":"customer"}`))
+		case "/v1/payment-instructions":
+			_, _ = w.Write([]byte(`{"card_number":"6037-0000","card_owner":"Test Owner","instructions":"واریز دقیق مبلغ","min_topup_toman":50000}`))
+		case "/v1/wallet/topups":
+			created++
+			_, _ = w.Write([]byte(`{"topup_id":12,"amount_toman":75000,"status":"awaiting_receipt"}`))
+		default:
+			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+	var sentText string
+	telegramServer := fakeTelegramServer(t, func(method string, body map[string]any) {
+		if method == "sendMessage" {
+			sentText, _ = body["text"].(string)
+		}
+	})
+	defer telegramServer.Close()
+	bot, err := telebot.NewBot(telebot.Settings{Token: "test-token", URL: telegramServer.URL, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	app.setState(42, conversation{OperationKey: "topup-test-key"})
+	ctx := bot.NewContext(telebot.Update{Message: &telebot.Message{ID: 8, Sender: &telebot.User{ID: 42}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}}})
+	if err = app.createTopup(ctx, 75000); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"6037-0000", "Test Owner", "واریز دقیق مبلغ", "حداقل شارژ: 50,000 تومان", "75,000 تومان", "رسید"} {
+		if !strings.Contains(sentText, want) {
+			t.Fatalf("top-up screen missing %q: %s", want, sentText)
+		}
+	}
+	if created != 1 {
+		t.Fatalf("created top-up count=%d, want 1", created)
+	}
+	sentText = ""
+	if err = app.createTopup(ctx, 25000); err != nil {
+		t.Fatal(err)
+	}
+	if created != 1 {
+		t.Fatalf("below-minimum amount created a top-up: %d", created)
+	}
+	if !strings.Contains(sentText, "حداقل مبلغ شارژ") {
+		t.Fatalf("below-minimum prompt missing: %s", sentText)
+	}
+}
+
+func TestCallbackBackendFailureReplacesStaleKeyboard(t *testing.T) {
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/actors/resolve" {
+			_, _ = w.Write([]byte(`{"telegram_id":42,"role":"customer"}`))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"code":"unavailable","message":"retry"}}`))
+	})
+	defer backendServer.Close()
+	var edited map[string]any
+	telegramServer := fakeTelegramServer(t, func(method string, body map[string]any) {
+		if method == "editMessageText" {
+			edited = body
+		}
+	})
+	defer telegramServer.Close()
+	bot, err := telebot.NewBot(telebot.Settings{Token: "test-token", URL: telegramServer.URL, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	app.register(bot)
+	app.setState(42, conversation{})
+	nonce := app.state(42).Nonce
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{ID: "failure", Sender: &telebot.User{ID: 42}, Data: "\fnav|" + nonce + "|plans-paid", Message: &telebot.Message{ID: 99, Sender: &telebot.User{}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}}}})
+	if edited == nil {
+		t.Fatal("backend failure did not replace callback message with a fresh menu")
+	}
+	markup := requestMarkup(t, edited)
+	rows, _ := markup["inline_keyboard"].([]any)
+	if len(rows) == 0 {
+		encoded, _ := json.Marshal(edited)
+		t.Fatalf("fresh error screen has no retry action: %s", encoded)
+	}
+	if _, ok := app.consumeCallbackState(42, nonce); ok {
+		t.Fatal("error screen retained consumed callback nonce")
+	}
+}
+
+func TestFailedPurchaseKeepsQuoteAndIdempotencyForRetry(t *testing.T) {
+	var purchaseCalls int
+	var idempotencyKeys []string
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":42,"role":"customer"}`))
+		case "/v1/features":
+			_, _ = w.Write([]byte(`{"features":{"purchases_enabled":true,"wallet_enabled":true},"text":{}}`))
+		case "/v1/purchases":
+			purchaseCalls++
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			idempotencyKeys = append(idempotencyKeys, body["idempotency_key"].(string))
+			if purchaseCalls == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":{"code":"unavailable","message":"retry"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"order_id":4,"amount_toman":12000,"status":"paid"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+	var edited map[string]any
+	telegramServer := fakeTelegramServer(t, func(method string, body map[string]any) {
+		if method == "editMessageText" {
+			edited = body
+		}
+	})
+	defer telegramServer.Close()
+	bot, err := telebot.NewBot(telebot.Settings{Token: "test-token", URL: telegramServer.URL, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	app.register(bot)
+	app.setState(42, conversation{QuoteID: 101, QuotePrice: 12000, OperationKey: "stable-purchase-op"})
+	nonce := app.state(42).Nonce
+	message := &telebot.Message{ID: 99, Sender: &telebot.User{}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{ID: "purchase-first", Sender: &telebot.User{ID: 42}, Data: "\fnav|" + nonce + "|method-wallet", Message: message}})
+	if purchaseCalls != 1 || edited == nil {
+		t.Fatalf("first callback did not produce retry screen: calls=%d edited=%v", purchaseCalls, edited != nil)
+	}
+	markup := requestMarkup(t, edited)
+	rows, _ := markup["inline_keyboard"].([]any)
+	if len(rows) == 0 {
+		t.Fatal("retry screen has no usable buttons")
+	}
+	newNonce := app.state(42).Nonce
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{ID: "purchase-retry", Sender: &telebot.User{ID: 42}, Data: "\fnav|" + newNonce + "|retry-purchase", Message: message}})
+	if purchaseCalls != 2 {
+		t.Fatalf("retry did not reach backend: calls=%d", purchaseCalls)
+	}
+	if len(idempotencyKeys) != 2 || idempotencyKeys[0] != idempotencyKeys[1] || idempotencyKeys[0] != "purchase-stable-purchase-op" {
+		t.Fatalf("retry changed idempotency key: %#v", idempotencyKeys)
 	}
 }
