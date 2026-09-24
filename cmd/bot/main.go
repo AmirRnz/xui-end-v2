@@ -51,6 +51,39 @@ type purchase struct {
 	SubscriptionID int64  `json:"subscription_id"`
 	Amount         int64  `json:"amount_toman"`
 }
+type subscriptionView struct {
+	ID                int64    `json:"id"`
+	Email             string   `json:"email"`
+	DisplayName       string   `json:"display_name"`
+	Status            string   `json:"status"`
+	Kind              string   `json:"kind"`
+	IPLimit           int      `json:"ip_limit"`
+	TrafficLimitBytes int64    `json:"traffic_limit_bytes"`
+	ExpiryTimeMS      int64    `json:"expiry_time_ms"`
+	Links             []string `json:"links"`
+}
+type subscriptionLinkPage struct {
+	Subscription subscriptionView
+	LinkIndex    int
+}
+
+func subscriptionLinkPages(subscriptions []subscriptionView) []subscriptionLinkPage {
+	pages := make([]subscriptionLinkPage, 0, len(subscriptions))
+	for _, sub := range subscriptions {
+		hasLink := false
+		for i, link := range sub.Links {
+			if strings.TrimSpace(link) != "" {
+				pages = append(pages, subscriptionLinkPage{sub, i})
+				hasLink = true
+			}
+		}
+		if !hasLink {
+			pages = append(pages, subscriptionLinkPage{sub, -1})
+		}
+	}
+	return pages
+}
+
 type receiptState struct {
 	Kind string
 	ID   int64
@@ -262,6 +295,21 @@ func (a *botApp) home(c telebot.Context, message string, edit bool) error {
 	}
 	return present(c, message, m, edit)
 }
+func (a *botApp) freshHome(c telebot.Context, message string) error {
+	a.setState(c.Sender().ID, conversation{})
+	st := a.state(c.Sender().ID)
+	m := &telebot.ReplyMarkup{}
+	rows := []telebot.Row{m.Row(m.Data("🛍 طرح‌های خرید", "nav", st.Nonce, "plans-paid"), m.Data("🧪 طرح‌های تست", "nav", st.Nonce, "plans-test")), m.Row(m.Data("💳 شارژ کیف پول", "nav", st.Nonce, "topup"), m.Data("👛 موجودی", "nav", st.Nonce, "wallet")), m.Row(m.Data("📜 تراکنش‌ها", "nav", st.Nonce, "ledger"), m.Data("📡 اشتراک‌های من", "nav", st.Nonce, "services"))}
+	if c.Sender().ID == adminTelegramID {
+		rows = append(rows, m.Row(m.Data("⚙️ مدیریت", "nav", st.Nonce, "admin")))
+	}
+	rows = append(rows, m.Row(m.Data("🔄 خانه", "nav", st.Nonce, "home")))
+	m.Inline(rows...)
+	if err := c.Edit(message, m); err == nil {
+		return nil
+	}
+	return c.Send(message, m)
+}
 func (a *botApp) getFeatures(c telebot.Context) (publicFeatures, error) {
 	act, err := a.resolve(c)
 	if err != nil {
@@ -295,15 +343,24 @@ func (a *botApp) callback(c telebot.Context) error {
 		return nil
 	}
 	if cb.Unique != "\fnav" {
-		return c.Respond(&telebot.CallbackResponse{Text: "این دکمه شناخته نشد.", ShowAlert: true})
+		if err := c.Respond(&telebot.CallbackResponse{Text: "این گزینه منقضی شد.", ShowAlert: true}); err != nil {
+			log.Printf("callback acknowledgement failed")
+		}
+		return a.freshHome(c, "از منوی تازه ادامه دهید.")
 	}
 	fields := strings.Split(c.Data(), "|")
 	if len(fields) < 2 {
-		return c.Respond(&telebot.CallbackResponse{Text: "دکمه نامعتبر است.", ShowAlert: true})
+		if err := c.Respond(&telebot.CallbackResponse{Text: "این گزینه منقضی شد.", ShowAlert: true}); err != nil {
+			log.Printf("callback acknowledgement failed")
+		}
+		return a.freshHome(c, "از منوی تازه ادامه دهید.")
 	}
 	st := a.state(c.Sender().ID)
 	if fields[0] != st.Nonce {
-		return c.Respond(&telebot.CallbackResponse{Text: "این صفحه قدیمی است. از خانه دوباره باز کنید.", ShowAlert: true})
+		if err := c.Respond(&telebot.CallbackResponse{Text: "صفحه به‌روز شد.", ShowAlert: true}); err != nil {
+			log.Printf("callback acknowledgement failed")
+		}
+		return a.freshHome(c, "این دکمه منقضی شده بود. از منوی تازه ادامه دهید.")
 	}
 	if err := c.Respond(); err != nil {
 		log.Printf("callback acknowledgement failed: %v", err)
@@ -352,7 +409,7 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 			return a.createTrial(c, id)
 		}
 		st.PlanID = id
-		st.OperationKey = stableKey(c.Sender().ID, c.Chat().ID, int64(c.Callback().Message.ID), "purchase")
+		st.OperationKey = callbackOperationKey(c, "purchase", strconv.FormatInt(id, 10))
 		st = a.next(st)
 		a.setState(c.Sender().ID, st)
 		st = a.state(c.Sender().ID)
@@ -390,7 +447,7 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 			return a.home(c, "شارژ کیف پول در حال حاضر غیرفعال است.", true)
 		}
 		st.Step = "topup-amount"
-		st.OperationKey = stableKey(c.Sender().ID, c.Chat().ID, int64(c.Callback().Message.ID), "topup")
+		st.OperationKey = callbackOperationKey(c, "topup", "")
 		st = a.next(st)
 		a.setState(c.Sender().ID, st)
 		return a.prompt(c, "مبلغ شارژ را به تومان بفرستید.", true)
@@ -414,6 +471,15 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 		return a.ledger(c, true)
 	case "services":
 		return a.services(c, true)
+	case "services-page":
+		if len(args) != 1 {
+			return a.services(c, true)
+		}
+		offset, e := strconv.Atoi(args[0])
+		if e != nil || offset < 0 {
+			return a.services(c, true)
+		}
+		return a.servicesPage(c, true, offset)
 	case "cancel":
 		if len(args) != 1 {
 			return a.home(c, "درخواست نامعتبر است.", true)
@@ -608,7 +674,7 @@ func (a *botApp) createTrial(c telebot.Context, planID int64) error {
 	if err != nil {
 		return sendFailure(c, err)
 	}
-	key := stableKey(c.Sender().ID, c.Chat().ID, int64(c.Callback().Message.ID), "trial")
+	key := callbackOperationKey(c, "trial", strconv.FormatInt(planID, 10))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	var out purchase
@@ -803,11 +869,14 @@ func (a *botApp) photo(c telebot.Context) error {
 	return a.home(c, "رسید ثبت شد و برای بررسی اپراتور در صف قرار گرفت.", false)
 }
 func (a *botApp) services(c telebot.Context, edit bool) error {
+	return a.servicesPage(c, edit, 0)
+}
+func (a *botApp) servicesPage(c telebot.Context, edit bool, offset int) error {
 	act, err := a.resolve(c)
 	if err != nil {
 		return sendFailure(c, err)
 	}
-	var out []map[string]any
+	var out []subscriptionView
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err = a.api.Call(ctx, "GET", "/v1/subscriptions", act.TelegramID, nil, &out); err != nil {
@@ -816,22 +885,46 @@ func (a *botApp) services(c telebot.Context, edit bool) error {
 	if len(out) == 0 {
 		return a.home(c, "اشتراکی ثبت نشده است.", edit)
 	}
-	if len(out) > 10 {
-		out = out[:10]
+	pages := subscriptionLinkPages(out)
+	if offset < 0 {
+		offset = 0
 	}
-	var b strings.Builder
+	if offset >= len(pages) {
+		offset = len(pages) - 1
+	}
+	page := pages[offset]
+	sub := page.Subscription
+	text := fmt.Sprintf("اتصال %d از %d\nاشتراک: %s (#%d)\nوضعیت: %s | نوع: %s\nایمیل: %s\nمحدودیت IP: %d | حجم: %d بایت", offset+1, len(pages), sub.DisplayName, sub.ID, sub.Status, sub.Kind, sub.Email, sub.IPLimit, sub.TrafficLimitBytes)
+	if sub.ExpiryTimeMS > 0 {
+		text += fmt.Sprintf("\nپایان اعتبار: %s", time.UnixMilli(sub.ExpiryTimeMS).UTC().Format("2006-01-02 15:04 UTC"))
+	}
 	m := &telebot.ReplyMarkup{}
 	st := a.state(c.Sender().ID)
-	rows := make([]telebot.Row, 0, len(out)+1)
-	for _, s := range out {
-		fmt.Fprintf(&b, "%v — %v — %v — %v\n", s["id"], s["display_name"], s["status"], s["email"])
-		id := fmt.Sprint(s["id"])
-		label := fmt.Sprintf("لغو اشتراک %s", id)
-		rows = append(rows, m.Row(m.Data(label, "nav", st.Nonce, "cancel", id)))
+	rows := make([]telebot.Row, 0, 5)
+	if page.LinkIndex >= 0 {
+		link := sub.Links[page.LinkIndex]
+		if strings.HasPrefix(link, "https://") || strings.HasPrefix(link, "http://") {
+			rows = append(rows, m.Row(m.URL("🔗 باز کردن اتصال", link)))
+		} else {
+			text += fmt.Sprintf("\nلینک %d از %d:\n%s", page.LinkIndex+1, len(sub.Links), link)
+		}
+	} else {
+		text += "\nهنوز لینک اتصالی در دسترس نیست."
+	}
+	rows = append(rows, m.Row(m.Data("درخواست لغو اشتراک", "nav", st.Nonce, "cancel", strconv.FormatInt(sub.ID, 10))))
+	navigation := make([]telebot.Btn, 0, 2)
+	if offset > 0 {
+		navigation = append(navigation, m.Data("◀ قبلی", "nav", st.Nonce, "services-page", strconv.Itoa(offset-1)))
+	}
+	if offset+1 < len(pages) {
+		navigation = append(navigation, m.Data("بعدی ▶", "nav", st.Nonce, "services-page", strconv.Itoa(offset+1)))
+	}
+	if len(navigation) > 0 {
+		rows = append(rows, m.Row(navigation...))
 	}
 	rows = append(rows, m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
 	m.Inline(rows...)
-	return present(c, strings.TrimSpace(b.String()), m, edit)
+	return present(c, text, m, edit)
 }
 func (a *botApp) cancelSubscription(c telebot.Context, id int64) error {
 	act, err := a.resolve(c)
@@ -841,7 +934,7 @@ func (a *botApp) cancelSubscription(c telebot.Context, id int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var out map[string]any
-	key := stableKey(c.Sender().ID, c.Chat().ID, int64(c.Callback().Message.ID), "cancel")
+	key := callbackOperationKey(c, "cancel", strconv.FormatInt(id, 10))
 	if err = a.api.Call(ctx, "POST", fmt.Sprintf("/v1/subscriptions/%d/cancel", id), act.TelegramID, map[string]any{"idempotency_key": key}, &out); err != nil {
 		return sendFailure(c, err)
 	}
@@ -1546,6 +1639,25 @@ func stableKey(senderID, chatID, messageID int64, operation string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%d:%s", senderID, chatID, messageID, operation)))
 	return hex.EncodeToString(sum[:])
 }
+func sessionKey(senderID, chatID, messageID int64, session, operation, target string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%d:%s:%s:%s", senderID, chatID, messageID, session, operation, target)))
+	return hex.EncodeToString(sum[:])
+}
+func callbackOperationKey(c telebot.Context, operation, target string) string {
+	session := ""
+	if c.Callback() != nil {
+		parts := strings.Split(c.Data(), "|")
+		if len(parts) > 0 {
+			session = parts[0]
+		}
+	}
+	messageID := int64(0)
+	if c.Callback() != nil && c.Callback().Message != nil {
+		messageID = int64(c.Callback().Message.ID)
+	}
+	return sessionKey(c.Sender().ID, c.Chat().ID, messageID, session, operation, target)
+}
 func sendFailure(c telebot.Context, err error) error {
-	return c.Send("درخواست انجام نشد: " + err.Error())
+	log.Printf("user action failed")
+	return c.Send("درخواست انجام نشد. لطفاً دوباره از منو تلاش کنید یا با پشتیبانی تماس بگیرید.")
 }

@@ -49,3 +49,33 @@ func TestPaymentInstructionPatchPreservesOtherFields(t *testing.T) {
 		t.Fatalf("updating one payment field must preserve the other configured fields: %#v", updated)
 	}
 }
+
+func TestSessionOperationKeyDeduplicatesDeliveryButSeparatesActions(t *testing.T) {
+	same := sessionKey(41, 9, 120, "menu-a", "trial", "7")
+	if same != sessionKey(41, 9, 120, "menu-a", "trial", "7") {
+		t.Fatal("redelivery of the same action must reuse its idempotency key")
+	}
+	if same == sessionKey(41, 9, 120, "menu-b", "trial", "7") {
+		t.Fatal("a new menu session must get a distinct idempotency key")
+	}
+	if same == sessionKey(41, 9, 120, "menu-a", "trial", "8") {
+		t.Fatal("a different target must get a distinct idempotency key")
+	}
+	if same == sessionKey(41, 9, 120, "menu-a", "cancel", "7") {
+		t.Fatal("a different operation must get a distinct idempotency key")
+	}
+}
+
+func TestSubscriptionPagesExposeEveryLinkAndEmptyLinkSubscription(t *testing.T) {
+	subscriptions := []subscriptionView{
+		{ID: 10, Links: []string{"vless://one", "https://example.test/sub"}},
+		{ID: 11},
+	}
+	pages := subscriptionLinkPages(subscriptions)
+	if len(pages) != 3 {
+		t.Fatalf("expected one page per connection link and one empty subscription page, got %d", len(pages))
+	}
+	if pages[0].Subscription.ID != 10 || pages[0].LinkIndex != 0 || pages[1].Subscription.ID != 10 || pages[1].LinkIndex != 1 || pages[2].Subscription.ID != 11 || pages[2].LinkIndex != -1 {
+		t.Fatalf("subscription links were dropped or misordered: %#v", pages)
+	}
+}
