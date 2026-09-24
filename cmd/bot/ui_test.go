@@ -512,7 +512,7 @@ func TestPhotoWithoutLocalStateChoosesOlderAwaitingBehindSubmittedRequest(t *tes
 }
 
 func TestAdminReceiptViewAndConfirmedRejectUsePrivateBackendRoutes(t *testing.T) {
-	var rejected int
+	var rejected, approved int
 	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -522,12 +522,17 @@ func TestAdminReceiptViewAndConfirmedRejectUsePrivateBackendRoutes(t *testing.T)
 			_, _ = w.Write([]byte(`{"channel":"retail-finland"}`))
 		case "/v1/admin/payments":
 			_, _ = w.Write([]byte(`[{"id":12,"telegram_id":42,"amount_toman":120000,"status":"receipt_submitted","telegram_file_id":"evidence-file"}]`))
+		case "/v1/admin/topups":
+			_, _ = w.Write([]byte(`[{"id":13,"telegram_id":42,"amount_toman":75000,"status":"receipt_submitted","telegram_file_id":"topup-evidence"}]`))
 		case "/v1/payment-intents/12/reject":
 			if r.Method != http.MethodPost {
 				t.Errorf("reject method = %s, want POST", r.Method)
 			}
 			rejected++
 			_, _ = w.Write([]byte(`{"payment_intent_id":12,"status":"rejected","already_rejected":false}`))
+		case "/v1/payment-intents/12/approve":
+			approved++
+			_, _ = w.Write([]byte(`{"payment_intent_id":12,"status":"approved"}`))
 		default:
 			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
 			http.NotFound(w, r)
@@ -556,6 +561,33 @@ func TestAdminReceiptViewAndConfirmedRejectUsePrivateBackendRoutes(t *testing.T)
 	app.setState(adminTelegramID, conversation{})
 	adminMessage := &telebot.Message{ID: 99, Sender: &telebot.User{}, Chat: &telebot.Chat{ID: adminTelegramID, Type: telebot.ChatPrivate}}
 	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "pending-list", Sender: &telebot.User{ID: adminTelegramID},
+		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|pending-payments", Message: adminMessage,
+	}})
+	listMarkup, _ := json.Marshal(lastMarkup)
+	if !strings.Contains(string(listMarkup), "view-payment-receipt") || strings.Contains(string(listMarkup), "approve-payment") || strings.Contains(string(listMarkup), "reject-payment") {
+		t.Fatalf("payment list must require opening evidence before decisions: %s", listMarkup)
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "forged-approve-before-review", Sender: &telebot.User{ID: adminTelegramID},
+		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|approve-payment|12", Message: adminMessage,
+	}})
+	if approved != 0 {
+		t.Fatal("payment was approved before its receipt was privately reviewed")
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "pending-topup-list", Sender: &telebot.User{ID: adminTelegramID},
+		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|pending-topups", Message: adminMessage,
+	}})
+	listMarkup, _ = json.Marshal(lastMarkup)
+	if !strings.Contains(string(listMarkup), "view-topup-receipt") || strings.Contains(string(listMarkup), "approve-topup") || strings.Contains(string(listMarkup), "reject-topup") {
+		t.Fatalf("top-up list must require opening evidence before decisions: %s", listMarkup)
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "pending-payment-list-again", Sender: &telebot.User{ID: adminTelegramID},
+		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|pending-payments", Message: adminMessage,
+	}})
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
 		ID: "view-receipt", Sender: &telebot.User{ID: adminTelegramID},
 		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|view-payment-receipt|12", Message: adminMessage,
 	}})
@@ -569,8 +601,8 @@ func TestAdminReceiptViewAndConfirmedRejectUsePrivateBackendRoutes(t *testing.T)
 		t.Fatal("receipt view did not include approve/reject controls")
 	}
 	encoded, _ := json.Marshal(lastMarkup)
-	if !strings.Contains(string(encoded), "reject-payment") {
-		t.Fatalf("receipt action menu lacks reject button: %s", encoded)
+	if !strings.Contains(string(encoded), "approve-payment") || !strings.Contains(string(encoded), "reject-payment") {
+		t.Fatalf("receipt detail lacks review controls: %s", encoded)
 	}
 	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
 		ID: "reject-confirmation", Sender: &telebot.User{ID: adminTelegramID},
@@ -587,9 +619,133 @@ func TestAdminReceiptViewAndConfirmedRejectUsePrivateBackendRoutes(t *testing.T)
 	if rejected != 1 {
 		t.Fatalf("payment reject calls=%d, want one", rejected)
 	}
+	if approved != 0 {
+		t.Fatalf("unexpected payment approvals=%d", approved)
+	}
 	group := bot.NewContext(telebot.Update{Message: &telebot.Message{Sender: &telebot.User{ID: adminTelegramID}, Chat: &telebot.Chat{ID: -9, Type: telebot.ChatGroup}}})
 	if _, err = app.requireRetailAdmin(group); err == nil {
 		t.Fatal("admin access was allowed from a group chat")
+	}
+}
+
+func TestAdminPendingReceiptListsPaginateBeyondTenWithoutDecisionButtons(t *testing.T) {
+	var listCalls, topupCalls int
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":96937669,"role":"admin"}`))
+		case "/v1/admin/config":
+			_, _ = w.Write([]byte(`{"channel":"retail-finland"}`))
+		case "/v1/admin/payments":
+			listCalls++
+			items := make([]pendingReceiptView, 12)
+			for i := range items {
+				items[i] = pendingReceiptView{ID: int64(i + 1), Amount: int64(1000 + i), Status: "receipt_submitted", TelegramFileID: fmt.Sprintf("file-%d", i+1)}
+			}
+			_ = json.NewEncoder(w).Encode(items)
+		case "/v1/admin/topups":
+			topupCalls++
+			items := make([]pendingReceiptView, 12)
+			for i := range items {
+				items[i] = pendingReceiptView{ID: int64(i + 101), Amount: int64(2000 + i), Status: "receipt_submitted", TelegramFileID: fmt.Sprintf("topup-file-%d", i+101)}
+			}
+			_ = json.NewEncoder(w).Encode(items)
+		default:
+			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+	var lastMessage map[string]any
+	tg := fakeTelegramServer(t, func(method string, body map[string]any) {
+		if method == "editMessageText" || method == "sendMessage" {
+			lastMessage = body
+		}
+	})
+	defer tg.Close()
+	bot, err := telebot.NewBot(telebot.Settings{Token: "test-token", URL: tg.URL, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	app.register(bot)
+	app.setState(adminTelegramID, conversation{})
+	adminMessage := &telebot.Message{ID: 99, Sender: &telebot.User{}, Chat: &telebot.Chat{ID: adminTelegramID, Type: telebot.ChatPrivate}}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "pending-page-one", Sender: &telebot.User{ID: adminTelegramID},
+		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|pending-payments", Message: adminMessage,
+	}})
+	if lastMessage == nil || !strings.Contains(fmt.Sprint(lastMessage["text"]), "1–8 از 12") {
+		t.Fatalf("first pending page missing range/count: %#v", lastMessage)
+	}
+	markupBytes, _ := json.Marshal(requestMarkup(t, lastMessage))
+	var markup struct {
+		InlineKeyboard [][]struct {
+			Data string `json:"callback_data"`
+		} `json:"inline_keyboard"`
+	}
+	if err = json.Unmarshal(markupBytes, &markup); err != nil {
+		t.Fatal(err)
+	}
+	var next string
+	viewCount := 0
+	for _, row := range markup.InlineKeyboard {
+		for _, button := range row {
+			if strings.Contains(button.Data, "view-payment-receipt") {
+				viewCount++
+			}
+			if strings.Contains(button.Data, "pending-payments-next") {
+				next = button.Data
+			}
+			if strings.Contains(button.Data, "approve-payment") || strings.Contains(button.Data, "reject-payment") {
+				t.Fatalf("pending list exposed a decision before evidence review: %s", button.Data)
+			}
+		}
+	}
+	if viewCount != adminReceiptMenuPageSize || next == "" {
+		t.Fatalf("first page controls: receipt buttons=%d next=%q markup=%s", viewCount, next, markupBytes)
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "pending-page-two", Sender: &telebot.User{ID: adminTelegramID}, Data: next, Message: adminMessage,
+	}})
+	if listCalls != 2 || !strings.Contains(fmt.Sprint(lastMessage["text"]), "9–12 از 12") || !strings.Contains(fmt.Sprint(lastMessage["text"]), "12") {
+		t.Fatalf("second pending page failed to expose later items: calls=%d message=%#v", listCalls, lastMessage)
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "topup-page-one", Sender: &telebot.User{ID: adminTelegramID},
+		Data: "\fnav|" + app.state(adminTelegramID).Nonce + "|pending-topups", Message: adminMessage,
+	}})
+	if !strings.Contains(fmt.Sprint(lastMessage["text"]), "1–8 از 12") {
+		t.Fatalf("first pending top-up page missing range/count: %#v", lastMessage)
+	}
+	markupBytes, _ = json.Marshal(requestMarkup(t, lastMessage))
+	if err = json.Unmarshal(markupBytes, &markup); err != nil {
+		t.Fatal(err)
+	}
+	next = ""
+	viewCount = 0
+	for _, row := range markup.InlineKeyboard {
+		for _, button := range row {
+			if strings.Contains(button.Data, "view-topup-receipt") {
+				viewCount++
+			}
+			if strings.Contains(button.Data, "pending-topups-next") {
+				next = button.Data
+			}
+			if strings.Contains(button.Data, "approve-topup") || strings.Contains(button.Data, "reject-topup") {
+				t.Fatalf("pending top-up list exposed a decision before evidence review: %s", button.Data)
+			}
+		}
+	}
+	if viewCount != adminReceiptMenuPageSize || next == "" {
+		t.Fatalf("first top-up page controls: receipt buttons=%d next=%q markup=%s", viewCount, next, markupBytes)
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "topup-page-two", Sender: &telebot.User{ID: adminTelegramID}, Data: next, Message: adminMessage,
+	}})
+	if topupCalls != 2 || !strings.Contains(fmt.Sprint(lastMessage["text"]), "9–12 از 12") || !strings.Contains(fmt.Sprint(lastMessage["text"]), "112") {
+		t.Fatalf("second pending top-up page failed to expose later items: calls=%d message=%#v", topupCalls, lastMessage)
 	}
 }
 
