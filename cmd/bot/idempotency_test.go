@@ -1,11 +1,23 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"example.com/xui-end-bot-v2/internal/backend"
 )
+
+func TestAdminConfigDecodesBackendStringIdentifiers(t *testing.T) {
+	const response = `{"deployment_id":"retail-finland","channel":"retail-finland","plans":[],"payment_instructions":{},"settings":{"retail_trial_reset_days":0,"features":{},"text":{}},"panel":{"id":"panel-retail-finland","base_url":"https://panel.example.test","token_configured":false}}`
+	var cfg adminConfig
+	if err := json.Unmarshal([]byte(response), &cfg); err != nil {
+		t.Fatalf("decode backend admin config: %v", err)
+	}
+	if cfg.DeploymentID != "retail-finland" || cfg.Panel.ID != "panel-retail-finland" {
+		t.Fatalf("backend string identifiers were not preserved: deployment=%q panel=%q", cfg.DeploymentID, cfg.Panel.ID)
+	}
+}
 
 func TestStableKeyTracksTelegramMessageAndOperation(t *testing.T) {
 	first := stableKey(41, 9, 120, "purchase")

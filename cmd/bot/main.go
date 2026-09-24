@@ -129,7 +129,7 @@ type adminPlan struct {
 	UsageDescription   string  `json:"usage_description"`
 }
 type adminConfig struct {
-	DeploymentID        int64             `json:"deployment_id"`
+	DeploymentID        string            `json:"deployment_id"`
 	Channel             string            `json:"channel"`
 	Plans               []adminPlan       `json:"plans"`
 	PaymentInstructions map[string]string `json:"payment_instructions"`
@@ -140,7 +140,7 @@ type adminConfig struct {
 		Text                      map[string]string `json:"text"`
 	} `json:"settings"`
 	Panel struct {
-		ID              int64  `json:"id"`
+		ID              string `json:"id"`
 		BaseURL         string `json:"base_url"`
 		TokenConfigured bool   `json:"token_configured"`
 	} `json:"panel"`
@@ -1066,7 +1066,7 @@ func (a *botApp) adminConfig(c telebot.Context, edit bool) error {
 	st := a.state(c.Sender().ID)
 	m := &telebot.ReplyMarkup{}
 	m.Inline(m.Row(m.Data("📦 طرح‌ها و قیمت‌ها", "nav", st.Nonce, "config-plans")), m.Row(m.Data("💳 اطلاعات پرداخت", "nav", st.Nonce, "config-payment")), m.Row(m.Data("🧪 سیاست تست و امکانات", "nav", st.Nonce, "config-settings")), m.Row(m.Data("🖥 تنظیم پنل", "nav", st.Nonce, "config-panel")), m.Row(m.Data("↩️ مدیریت", "nav", st.Nonce, "admin")))
-	return present(c, fmt.Sprintf("پیکربندی %s | شناسه استقرار: %d", cfg.Channel, cfg.DeploymentID), m, edit)
+	return present(c, fmt.Sprintf("پیکربندی %s | شناسه استقرار: %s", cfg.Channel, cfg.DeploymentID), m, edit)
 }
 func (a *botApp) requireAdmin(c telebot.Context) (actor, error) {
 	act, err := a.resolve(c)
