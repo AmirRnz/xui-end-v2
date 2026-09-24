@@ -118,31 +118,50 @@ type activeReceiptRequest struct {
 	CreatedAt string `json:"created_at"`
 }
 type activePaymentIntentResponse struct {
-	PaymentIntent *activeReceiptRequest `json:"payment_intent"`
+	PaymentIntent  *activeReceiptRequest   `json:"payment_intent"`
+	PaymentIntents []*activeReceiptRequest `json:"payment_intents"`
+	NextCursor     *int64                  `json:"next_cursor"`
 }
 type activeTopupResponse struct {
-	Topup *activeReceiptRequest `json:"topup"`
+	Topup      *activeReceiptRequest   `json:"topup"`
+	Topups     []*activeReceiptRequest `json:"topups"`
+	NextCursor *int64                  `json:"next_cursor"`
+}
+type receiptPageCursor struct {
+	Payment int64
+	Topup   int64
+}
+type activeReceiptPage struct {
+	Payments    []*activeReceiptRequest
+	Topups      []*activeReceiptRequest
+	PaymentNext *int64
+	TopupNext   *int64
 }
 type conversation struct {
-	Nonce              string
-	Step               string
-	PlanID             int64
-	Method             string
-	Months             int
-	IPLimit            int
-	DataGB             int
-	Name               string
-	Receipt            *receiptState
-	ReceiptPhotoFileID string
-	Admin              string
-	AdminID            int64
-	PanelURL           string
-	Draft              *adminPlan
-	OperationKey       string
-	QuoteID            int64
-	QuotePrice         int64
-	RefundSubID        int64
-	Updated            time.Time
+	Nonce                    string
+	Step                     string
+	PlanID                   int64
+	Method                   string
+	Months                   int
+	IPLimit                  int
+	DataGB                   int
+	Name                     string
+	Receipt                  *receiptState
+	ReceiptPhotoFileID       string
+	ReceiptPagePaymentBefore int64
+	ReceiptPageTopupBefore   int64
+	ReceiptPagePaymentNext   int64
+	ReceiptPageTopupNext     int64
+	ReceiptPageHistory       []receiptPageCursor
+	Admin                    string
+	AdminID                  int64
+	PanelURL                 string
+	Draft                    *adminPlan
+	OperationKey             string
+	QuoteID                  int64
+	QuotePrice               int64
+	RefundSubID              int64
+	Updated                  time.Time
 }
 type adminPlan struct {
 	ID                 int64   `json:"id,omitempty"`
@@ -331,66 +350,134 @@ func (a *botApp) start(c telebot.Context) error {
 	return a.home(c, "👋 به پنل کاربری خوش آمدید\nسرویس وی‌پی‌ان خود را مدیریت کنید یا سرویس جدید خریداری نمایید.", false)
 }
 
-func (a *botApp) activeReceipts(c telebot.Context, act actor) (*activeReceiptRequest, *activeReceiptRequest, error) {
+const receiptMenuPageSize = 6
+const receiptHistoryLimit = 50
+
+func activeReceiptPath(path string, before int64) string {
+	if before > 0 {
+		return fmt.Sprintf("%s?before_id=%d", path, before)
+	}
+	return path
+}
+
+func (a *botApp) activeReceipts(c telebot.Context, act actor, beforePayment, beforeTopup int64) (activeReceiptPage, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	var payment activePaymentIntentResponse
-	if err := a.api.Call(ctx, "GET", "/v1/payment-intents/active", act.TelegramID, nil, &payment); err != nil {
-		return nil, nil, err
+	var page activeReceiptPage
+	if beforePayment != -1 {
+		var payment activePaymentIntentResponse
+		if err := a.api.Call(ctx, "GET", activeReceiptPath("/v1/payment-intents/active", beforePayment), act.TelegramID, nil, &payment); err != nil {
+			return activeReceiptPage{}, err
+		}
+		page.Payments = payment.PaymentIntents
+		if page.Payments == nil && payment.PaymentIntent != nil {
+			page.Payments = []*activeReceiptRequest{payment.PaymentIntent}
+		}
+		page.PaymentNext = payment.NextCursor
 	}
-	var topup activeTopupResponse
-	if err := a.api.Call(ctx, "GET", "/v1/wallet/topups/active", act.TelegramID, nil, &topup); err != nil {
-		return nil, nil, err
+	if beforeTopup != -1 {
+		var topup activeTopupResponse
+		if err := a.api.Call(ctx, "GET", activeReceiptPath("/v1/wallet/topups/active", beforeTopup), act.TelegramID, nil, &topup); err != nil {
+			return activeReceiptPage{}, err
+		}
+		page.Topups = topup.Topups
+		if page.Topups == nil && topup.Topup != nil {
+			page.Topups = []*activeReceiptRequest{topup.Topup}
+		}
+		page.TopupNext = topup.NextCursor
 	}
-	return payment.PaymentIntent, topup.Topup, nil
+	return page, nil
 }
 
 func (a *botApp) resumeReceiptMenu(c telebot.Context, act actor) (bool, error) {
-	payment, topup, err := a.activeReceipts(c, act)
+	return a.showActiveReceiptPage(c, act, receiptPageCursor{}, nil, "", false)
+}
+
+func nextReceiptCursor(items []*activeReceiptRequest, backendNext *int64) int64 {
+	if len(items) > receiptMenuPageSize {
+		return items[receiptMenuPageSize-1].ID
+	}
+	if backendNext != nil && *backendNext > 0 {
+		return *backendNext
+	}
+	return -1
+}
+
+func appendReceiptRows(m *telebot.ReplyMarkup, rows *[]telebot.Row, st conversation, kind string, items []*activeReceiptRequest, text *strings.Builder) {
+	label := "پرداخت مستقیم"
+	action := "resume-payment"
+	if kind == "topup" {
+		label = "شارژ کیف پول"
+		action = "resume-topup"
+	}
+	if len(items) == 0 {
+		return
+	}
+	fmt.Fprintf(text, "%s‌های باز:\n", label)
+	limit := len(items)
+	if limit > receiptMenuPageSize {
+		limit = receiptMenuPageSize
+	}
+	for _, item := range items[:limit] {
+		if item == nil {
+			continue
+		}
+		if item.Status == "awaiting_receipt" {
+			fmt.Fprintf(text, "#%d — %s تومان، منتظر رسید\n", item.ID, formatToman(item.Amount))
+			*rows = append(*rows, m.Row(m.Data(fmt.Sprintf("📷 ارسال رسید %s #%d", label, item.ID), "nav", st.Nonce, action, strconv.FormatInt(item.ID, 10))))
+		} else if item.Status == "receipt_submitted" {
+			fmt.Fprintf(text, "#%d — %s تومان، رسید در انتظار بررسی\n", item.ID, formatToman(item.Amount))
+		}
+	}
+}
+
+func (a *botApp) showActiveReceiptPage(c telebot.Context, act actor, cursor receiptPageCursor, history []receiptPageCursor, photoFileID string, edit bool) (bool, error) {
+	page, err := a.activeReceipts(c, act, cursor.Payment, cursor.Topup)
 	if err != nil {
 		return false, err
 	}
-	var awaiting []receiptState
-	var status []string
-	if payment != nil {
-		if payment.Status == "awaiting_receipt" {
-			awaiting = append(awaiting, receiptState{Kind: "payment", ID: payment.ID})
-		} else if payment.Status == "receipt_submitted" {
-			status = append(status, fmt.Sprintf("رسید پرداخت مستقیم #%d به مبلغ %s تومان در انتظار بررسی مدیریت است.", payment.ID, formatToman(payment.Amount)))
-		}
-	}
-	if topup != nil {
-		if topup.Status == "awaiting_receipt" {
-			awaiting = append(awaiting, receiptState{Kind: "topup", ID: topup.ID})
-		} else if topup.Status == "receipt_submitted" {
-			status = append(status, fmt.Sprintf("رسید شارژ کیف پول #%d به مبلغ %s تومان در انتظار بررسی مدیریت است.", topup.ID, formatToman(topup.Amount)))
-		}
-	}
-	if len(awaiting) == 0 && len(status) == 0 {
+	if len(page.Payments) == 0 && len(page.Topups) == 0 && page.PaymentNext == nil && page.TopupNext == nil {
 		return false, nil
 	}
-	if len(awaiting) == 0 {
-		return true, a.home(c, strings.Join(status, "\n")+"\n\nصفحه اصلی", false)
+	paymentNext := nextReceiptCursor(page.Payments, page.PaymentNext)
+	topupNext := nextReceiptCursor(page.Topups, page.TopupNext)
+	state := conversation{
+		ReceiptPhotoFileID:       photoFileID,
+		ReceiptPagePaymentBefore: cursor.Payment,
+		ReceiptPageTopupBefore:   cursor.Topup,
+		ReceiptPagePaymentNext:   paymentNext,
+		ReceiptPageTopupNext:     topupNext,
+		ReceiptPageHistory:       append([]receiptPageCursor(nil), history...),
 	}
-	selected := awaiting[0]
-	a.setState(c.Sender().ID, conversation{Receipt: &receiptState{Kind: selected.Kind, ID: selected.ID}, Step: "receipt-photo"})
+	a.setState(c.Sender().ID, state)
 	st := a.state(c.Sender().ID)
 	m := &telebot.ReplyMarkup{}
-	rows := make([]telebot.Row, 0, len(awaiting)+1)
-	for _, receipt := range awaiting {
-		label := fmt.Sprintf("📷 ادامه ارسال رسید پرداخت #%d", receipt.ID)
-		action := "resume-payment"
-		if receipt.Kind == "topup" {
-			label = fmt.Sprintf("📷 ادامه ارسال رسید شارژ #%d", receipt.ID)
-			action = "resume-topup"
-		}
-		rows = append(rows, m.Row(m.Data(label, "nav", st.Nonce, action, strconv.FormatInt(receipt.ID, 10))))
+	var rows []telebot.Row
+	var text strings.Builder
+	if cursor.Payment > 0 || cursor.Topup > 0 {
+		text.WriteString("درخواست‌های قدیمی‌تر:\n")
+	}
+	appendReceiptRows(m, &rows, st, "payment", page.Payments, &text)
+	appendReceiptRows(m, &rows, st, "topup", page.Topups, &text)
+	if len(rows) == 0 && paymentNext == -1 && topupNext == -1 {
+		return false, nil
+	}
+	if paymentNext != -1 || topupNext != -1 {
+		rows = append(rows, m.Row(m.Data("درخواست‌های قدیمی‌تر »", "nav", st.Nonce, "receipt-page-next")))
+	}
+	if len(history) > 0 {
+		rows = append(rows, m.Row(m.Data("« صفحه قبلی", "nav", st.Nonce, "receipt-page-prev")))
 	}
 	rows = append(rows, m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
 	m.Inline(rows...)
-	message := "یک درخواست پرداخت بدون رسید پیدا شد. برای ادامه، درخواست را انتخاب کنید و سپس عکس رسید را بفرستید."
-	if len(status) > 0 {
-		message = strings.Join(status, "\n") + "\n\n" + message
+	message := strings.TrimSpace(text.String())
+	if photoFileID != "" {
+		message = "عکس رسید دریافت شد. درخواست درست را انتخاب کنید: \n" + message
+	} else {
+		message = "درخواست‌های پرداخت و شارژ شما:\n" + message
+	}
+	if edit {
+		return true, c.Edit(message, m)
 	}
 	return true, c.Send(message, m)
 }
@@ -407,15 +494,22 @@ func (a *botApp) resumeReceipt(c telebot.Context, kind string, args []string, st
 	if err != nil {
 		return sendFailure(c, err)
 	}
-	payment, topup, err := a.activeReceipts(c, act)
+	page, err := a.activeReceipts(c, act, st.ReceiptPagePaymentBefore, st.ReceiptPageTopupBefore)
 	if err != nil {
 		return sendFailure(c, err)
 	}
-	active := payment
+	var active *activeReceiptRequest
+	items := page.Payments
 	if kind == "topup" {
-		active = topup
+		items = page.Topups
 	}
-	if active == nil || active.ID != id || active.Status != "awaiting_receipt" {
+	for _, item := range items {
+		if item != nil && item.ID == id {
+			active = item
+			break
+		}
+	}
+	if active == nil || active.Status != "awaiting_receipt" {
 		return a.freshHome(c, "این درخواست دیگر منتظر رسید نیست.")
 	}
 	a.setState(c.Sender().ID, conversation{Receipt: &receiptState{Kind: kind, ID: id}, Step: "receipt-photo"})
@@ -424,6 +518,40 @@ func (a *botApp) resumeReceipt(c telebot.Context, kind string, args []string, st
 	}
 	return a.prompt(c, "عکس رسید را ارسال کنید.", true)
 }
+
+func (a *botApp) changeReceiptPage(c telebot.Context, st conversation, next bool) error {
+	cursor := receiptPageCursor{Payment: st.ReceiptPagePaymentBefore, Topup: st.ReceiptPageTopupBefore}
+	history := append([]receiptPageCursor(nil), st.ReceiptPageHistory...)
+	if next {
+		if st.ReceiptPagePaymentNext == -1 && st.ReceiptPageTopupNext == -1 {
+			return a.freshHome(c, "درخواست قدیمی‌تری پیدا نشد.")
+		}
+		if len(history) == receiptHistoryLimit {
+			history = history[1:]
+		}
+		history = append(history, cursor)
+		cursor = receiptPageCursor{Payment: st.ReceiptPagePaymentNext, Topup: st.ReceiptPageTopupNext}
+	} else {
+		if len(history) == 0 {
+			return a.freshHome(c, "صفحه قبلی پیدا نشد.")
+		}
+		cursor = history[len(history)-1]
+		history = history[:len(history)-1]
+	}
+	act, err := a.resolve(c)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	shown, err := a.showActiveReceiptPage(c, act, cursor, history, st.ReceiptPhotoFileID, true)
+	if err != nil {
+		return sendFailure(c, err)
+	}
+	if !shown {
+		return a.freshHome(c, "درخواست فعالی برای ارسال رسید پیدا نشد.")
+	}
+	return nil
+}
+
 func (a *botApp) adminCommand(c telebot.Context) error {
 	if !adminCommandSender(c.Sender(), c.Chat()) {
 		return c.Send("دسترسی مجاز نیست.")
@@ -813,6 +941,10 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 			kind = "topup"
 		}
 		return a.resumeReceipt(c, kind, args, st)
+	case "receipt-page-next":
+		return a.changeReceiptPage(c, st, true)
+	case "receipt-page-prev":
+		return a.changeReceiptPage(c, st, false)
 	case "admin":
 		return a.adminHome(c, true)
 	case "pending-payments":
@@ -1538,40 +1670,46 @@ func (a *botApp) photo(c telebot.Context) error {
 		if err != nil {
 			return sendFailure(c, err)
 		}
-		payment, topup, err := a.activeReceipts(c, act)
+		page, err := a.activeReceipts(c, act, 0, 0)
 		if err != nil {
 			return sendFailure(c, err)
 		}
 		var awaiting []receiptState
-		if payment != nil && payment.Status == "awaiting_receipt" {
-			awaiting = append(awaiting, receiptState{Kind: "payment", ID: payment.ID})
+		for _, item := range page.Payments {
+			if item != nil && item.Status == "awaiting_receipt" {
+				awaiting = append(awaiting, receiptState{Kind: "payment", ID: item.ID})
+			}
 		}
-		if topup != nil && topup.Status == "awaiting_receipt" {
-			awaiting = append(awaiting, receiptState{Kind: "topup", ID: topup.ID})
+		for _, item := range page.Topups {
+			if item != nil && item.Status == "awaiting_receipt" {
+				awaiting = append(awaiting, receiptState{Kind: "topup", ID: item.ID})
+			}
 		}
-		if len(awaiting) == 0 {
-			if payment != nil && payment.Status == "receipt_submitted" || topup != nil && topup.Status == "receipt_submitted" {
+		hasMore := page.PaymentNext != nil || page.TopupNext != nil
+		if len(awaiting) == 0 && !hasMore {
+			hasSubmitted := false
+			for _, item := range page.Payments {
+				hasSubmitted = hasSubmitted || item != nil && item.Status == "receipt_submitted"
+			}
+			for _, item := range page.Topups {
+				hasSubmitted = hasSubmitted || item != nil && item.Status == "receipt_submitted"
+			}
+			if hasSubmitted {
 				return a.home(c, "رسید قبلی شما در انتظار بررسی مدیریت است.", false)
 			}
 			return c.Send("درخواست فعالی برای ارسال رسید پیدا نشد. ابتدا خرید یا شارژ را شروع کنید.")
 		}
-		if len(awaiting) == 1 {
+		if len(awaiting) == 1 && !hasMore {
 			return a.submitReceipt(c, awaiting[0], msg.Photo.FileID)
 		}
-		a.setState(c.Sender().ID, conversation{Receipt: &awaiting[0], Step: "receipt-choice", ReceiptPhotoFileID: msg.Photo.FileID})
-		st = a.state(c.Sender().ID)
-		m := &telebot.ReplyMarkup{}
-		rows := make([]telebot.Row, 0, len(awaiting)+1)
-		for _, receipt := range awaiting {
-			label, action := fmt.Sprintf("ارسال به پرداخت #%d", receipt.ID), "resume-payment"
-			if receipt.Kind == "topup" {
-				label, action = fmt.Sprintf("ارسال به شارژ #%d", receipt.ID), "resume-topup"
-			}
-			rows = append(rows, m.Row(m.Data(label, "nav", st.Nonce, action, strconv.FormatInt(receipt.ID, 10))))
+		shown, err := a.showActiveReceiptPage(c, act, receiptPageCursor{}, nil, msg.Photo.FileID, false)
+		if err != nil {
+			return sendFailure(c, err)
 		}
-		rows = append(rows, m.Row(m.Data("🏠 خانه", "nav", st.Nonce, "home")))
-		m.Inline(rows...)
-		return c.Send("دو درخواست منتظر رسید دارید. این عکس را به کدام درخواست پیوند بدهم؟", m)
+		if !shown {
+			return c.Send("درخواست فعالی برای ارسال رسید پیدا نشد. ابتدا خرید یا شارژ را شروع کنید.")
+		}
+		return nil
 	}
 	return a.submitReceipt(c, *st.Receipt, msg.Photo.FileID)
 }

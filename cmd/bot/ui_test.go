@@ -351,9 +351,9 @@ func TestStartResumesActivePaymentAndTopup(t *testing.T) {
 		case "/v1/actors/resolve":
 			_, _ = w.Write([]byte(`{"telegram_id":42,"role":"customer"}`))
 		case "/v1/payment-intents/active":
-			_, _ = w.Write([]byte(`{"payment_intent":{"id":17,"status":"awaiting_receipt","amount_toman":120000}}`))
+			_, _ = w.Write([]byte(`{"payment_intents":[{"id":19,"status":"receipt_submitted","amount_toman":90000},{"id":17,"status":"awaiting_receipt","amount_toman":120000}],"next_cursor":null,"payment_intent":{"id":19,"status":"receipt_submitted","amount_toman":90000}}`))
 		case "/v1/wallet/topups/active":
-			_, _ = w.Write([]byte(`{"topup":{"id":23,"status":"awaiting_receipt","amount_toman":75000}}`))
+			_, _ = w.Write([]byte(`{"topups":[{"id":23,"status":"awaiting_receipt","amount_toman":75000}],"next_cursor":null,"topup":{"id":23,"status":"awaiting_receipt","amount_toman":75000}}`))
 		default:
 			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
 			http.NotFound(w, r)
@@ -376,7 +376,7 @@ func TestStartResumesActivePaymentAndTopup(t *testing.T) {
 	bot.ProcessUpdate(telebot.Update{Message: &telebot.Message{
 		ID: 7, Sender: &telebot.User{ID: 42}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}, Text: "/start",
 	}})
-	if sent == nil || !strings.Contains(fmt.Sprint(sent["text"]), "بدون رسید") {
+	if sent == nil || !strings.Contains(fmt.Sprint(sent["text"]), "درخواست‌های پرداخت") || !strings.Contains(fmt.Sprint(sent["text"]), "#19") {
 		t.Fatalf("start did not offer receipt recovery: %#v", sent)
 	}
 	markup := requestMarkup(t, sent)
@@ -388,7 +388,83 @@ func TestStartResumesActivePaymentAndTopup(t *testing.T) {
 	}
 }
 
-func TestPhotoWithoutLocalStateResumesActivePaymentIntent(t *testing.T) {
+func TestReceiptResumeMenuPaginatesOlderOutstandingRequests(t *testing.T) {
+	var olderCursor string
+	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/actors/resolve":
+			_, _ = w.Write([]byte(`{"telegram_id":42,"role":"customer"}`))
+		case "/v1/payment-intents/active":
+			if r.URL.Query().Get("before_id") == "5" {
+				olderCursor = "5"
+				_, _ = w.Write([]byte(`{"payment_intents":[{"id":4,"status":"awaiting_receipt","amount_toman":40000},{"id":3,"status":"receipt_submitted","amount_toman":30000},{"id":2,"status":"awaiting_receipt","amount_toman":20000},{"id":1,"status":"awaiting_receipt","amount_toman":10000}],"next_cursor":null,"payment_intent":{"id":4,"status":"awaiting_receipt","amount_toman":40000}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"payment_intents":[{"id":10,"status":"receipt_submitted","amount_toman":100000},{"id":9,"status":"receipt_submitted","amount_toman":90000},{"id":8,"status":"receipt_submitted","amount_toman":80000},{"id":7,"status":"receipt_submitted","amount_toman":70000},{"id":6,"status":"receipt_submitted","amount_toman":60000},{"id":5,"status":"receipt_submitted","amount_toman":50000},{"id":4,"status":"awaiting_receipt","amount_toman":40000},{"id":3,"status":"receipt_submitted","amount_toman":30000},{"id":2,"status":"awaiting_receipt","amount_toman":20000},{"id":1,"status":"awaiting_receipt","amount_toman":10000}],"next_cursor":null,"payment_intent":{"id":10,"status":"receipt_submitted","amount_toman":100000}}`))
+		case "/v1/wallet/topups/active":
+			_, _ = w.Write([]byte(`{"topups":[],"next_cursor":null,"topup":null}`))
+		default:
+			t.Errorf("unexpected backend request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
+	})
+	defer backendServer.Close()
+	var sent, edited map[string]any
+	tg := fakeTelegramServer(t, func(method string, body map[string]any) {
+		if method == "sendMessage" {
+			sent = body
+		}
+		if method == "editMessageText" {
+			edited = body
+		}
+	})
+	defer tg.Close()
+	bot, err := telebot.NewBot(telebot.Settings{Token: "test-token", URL: tg.URL, Synchronous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &botApp{api: api, states: make(map[int64]conversation)}
+	app.register(bot)
+	bot.ProcessUpdate(telebot.Update{Message: &telebot.Message{
+		ID: 7, Sender: &telebot.User{ID: 42}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}, Text: "/start",
+	}})
+	if sent == nil || !strings.Contains(fmt.Sprint(sent["text"]), "#10") {
+		t.Fatalf("newest recovery page missing: %#v", sent)
+	}
+	markupBytes, _ := json.Marshal(requestMarkup(t, sent))
+	var markup struct {
+		InlineKeyboard [][]struct {
+			Data string `json:"callback_data"`
+		} `json:"inline_keyboard"`
+	}
+	if err = json.Unmarshal(markupBytes, &markup); err != nil {
+		t.Fatal(err)
+	}
+	var next string
+	for _, row := range markup.InlineKeyboard {
+		for _, button := range row {
+			if strings.Contains(button.Data, "receipt-page-next") {
+				next = button.Data
+			}
+		}
+	}
+	if next == "" {
+		t.Fatalf("newest page has no older-page control: %s", markupBytes)
+	}
+	bot.ProcessUpdate(telebot.Update{Callback: &telebot.Callback{
+		ID: "older-page", Sender: &telebot.User{ID: 42}, Data: next,
+		Message: &telebot.Message{ID: 99, Sender: &telebot.User{}, Chat: &telebot.Chat{ID: 42, Type: telebot.ChatPrivate}},
+	}})
+	if olderCursor != "5" {
+		t.Fatalf("next screen before_id=%q, want exclusive cursor 5", olderCursor)
+	}
+	if edited == nil || !strings.Contains(fmt.Sprint(edited["text"]), "#4") || strings.Contains(fmt.Sprint(edited["text"]), "#10") {
+		t.Fatalf("older recovery page incorrect: %#v", edited)
+	}
+}
+
+func TestPhotoWithoutLocalStateChoosesOlderAwaitingBehindSubmittedRequest(t *testing.T) {
 	var receiptPosts int
 	var receivedFileID string
 	api, backendServer := testBackend(t, func(w http.ResponseWriter, r *http.Request) {
@@ -397,9 +473,9 @@ func TestPhotoWithoutLocalStateResumesActivePaymentIntent(t *testing.T) {
 		case "/v1/actors/resolve":
 			_, _ = w.Write([]byte(`{"telegram_id":42,"role":"customer"}`))
 		case "/v1/payment-intents/active":
-			_, _ = w.Write([]byte(`{"payment_intent":{"id":17,"status":"awaiting_receipt","amount_toman":120000}}`))
+			_, _ = w.Write([]byte(`{"payment_intents":[{"id":19,"status":"receipt_submitted","amount_toman":90000},{"id":17,"status":"awaiting_receipt","amount_toman":120000}],"next_cursor":null,"payment_intent":{"id":19,"status":"receipt_submitted","amount_toman":90000}}`))
 		case "/v1/wallet/topups/active":
-			_, _ = w.Write([]byte(`{"topup":null}`))
+			_, _ = w.Write([]byte(`{"topups":[],"next_cursor":null,"topup":null}`))
 		case "/v1/payment-intents/17/receipt":
 			receiptPosts++
 			var body map[string]string
