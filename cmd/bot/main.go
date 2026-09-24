@@ -625,10 +625,17 @@ func (a *botApp) route(c telebot.Context, action string, args []string, st conve
 	case "config-panel":
 		return a.adminPanel(c, true)
 	case "config-panel-url":
-		st.Admin = "panel-url"
-		st = a.next(st)
-		a.setState(c.Sender().ID, st)
-		return a.prompt(c, "آدرس پایه پنل را وارد کنید.", true)
+		err := beginPanelURLPrompt(c.Chat(), func() {
+			st.Admin = "panel-url"
+			st = a.next(st)
+			a.setState(c.Sender().ID, st)
+		}, func() error {
+			return a.prompt(c, "آدرس پایه پنل را وارد کنید.", true)
+		})
+		if errors.Is(err, errPanelPrivateChat) {
+			return c.Send("تنظیم کلید پنل فقط در گفت‌وگوی خصوصی با ربات مجاز است.")
+		}
+		return err
 	default:
 		return a.home(c, "این گزینه در دسترس نیست.", true)
 	}
@@ -1633,12 +1640,13 @@ func (a *botApp) adminTextInput(c telebot.Context, st conversation, value string
 		if c.Chat().Type != telebot.ChatPrivate {
 			return c.Send("تنظیم کلید پنل فقط در گفت‌وگوی خصوصی با ربات مجاز است.")
 		}
-		if c.Message() != nil {
-			if deleteErr := c.Delete(); deleteErr != nil {
-				log.Printf("could not remove panel credential message")
-			}
+		err = submitPanelToken(c.Chat(), c.Delete, func() error {
+			return a.api.Call(ctx, "PUT", "/v1/admin/config/panel", act.TelegramID, map[string]string{"base_url": st.PanelURL, "token": value}, &out)
+		})
+		if errors.Is(err, errPanelTokenDelete) {
+			a.clearState(c.Sender().ID)
+			return c.Send("پیام کلید حذف نشد و تنظیمی ذخیره نشد. لطفاً پیام کلید را خودتان حذف کنید و سپس تنظیم را دوباره از گفت‌وگوی خصوصی آغاز کنید.")
 		}
-		err = a.api.Call(ctx, "PUT", "/v1/admin/config/panel", act.TelegramID, map[string]string{"base_url": st.PanelURL, "token": value}, &out)
 	default:
 		return c.Send("این مرحله منقضی شده است. از منوی مدیریت دوباره شروع کنید.")
 	}
@@ -1648,6 +1656,30 @@ func (a *botApp) adminTextInput(c telebot.Context, st conversation, value string
 	a.clearState(c.Sender().ID)
 	return a.adminConfig(c, false)
 }
+
+var (
+	errPanelPrivateChat = errors.New("panel configuration requires a private chat")
+	errPanelTokenDelete = errors.New("panel token message could not be deleted")
+)
+
+func beginPanelURLPrompt(chat *telebot.Chat, setState func(), prompt func() error) error {
+	if chat == nil || chat.Type != telebot.ChatPrivate {
+		return errPanelPrivateChat
+	}
+	setState()
+	return prompt()
+}
+
+func submitPanelToken(chat *telebot.Chat, deleteMessage func() error, submit func() error) error {
+	if chat == nil || chat.Type != telebot.ChatPrivate {
+		return errPanelPrivateChat
+	}
+	if deleteMessage == nil || deleteMessage() != nil {
+		return errPanelTokenDelete
+	}
+	return submit()
+}
+
 func stableKey(senderID, chatID, messageID int64, operation string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%d:%s", senderID, chatID, messageID, operation)))
 	return hex.EncodeToString(sum[:])

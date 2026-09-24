@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"example.com/xui-end-bot-v2/internal/backend"
+	"gopkg.in/telebot.v3"
 )
 
 func TestAdminConfigDecodesBackendStringIdentifiers(t *testing.T) {
@@ -102,5 +104,37 @@ func TestFailureDiagnosticUsesOnlySanitizedBackendCategory(t *testing.T) {
 	status, category = failureDiagnostic(&backend.APIError{Status: 500, Code: "bad\nsecret", Message: "sensitive backend detail"})
 	if status != 500 || category != "backend_error" {
 		t.Fatalf("unsafe backend error code must be reduced to generic category, got %d/%q", status, category)
+	}
+}
+
+func TestPanelURLPromptRequiresPrivateChat(t *testing.T) {
+	stateSet, promptSent := false, false
+	err := beginPanelURLPrompt(&telebot.Chat{Type: telebot.ChatGroup}, func() {
+		stateSet = true
+	}, func() error {
+		promptSent = true
+		return nil
+	})
+	if !errors.Is(err, errPanelPrivateChat) {
+		t.Fatalf("group chat error = %v, want private-chat error", err)
+	}
+	if stateSet || promptSent {
+		t.Fatalf("group callback started panel setup: stateSet=%t promptSent=%t", stateSet, promptSent)
+	}
+}
+
+func TestPanelTokenDeleteFailureDoesNotSubmit(t *testing.T) {
+	submitted := false
+	err := submitPanelToken(&telebot.Chat{Type: telebot.ChatPrivate}, func() error {
+		return errors.New("delete failed")
+	}, func() error {
+		submitted = true
+		return nil
+	})
+	if !errors.Is(err, errPanelTokenDelete) {
+		t.Fatalf("delete failure error = %v, want token-delete error", err)
+	}
+	if submitted {
+		t.Fatal("token was submitted after Telegram message deletion failed")
 	}
 }
